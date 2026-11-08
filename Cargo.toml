@@ -1,0 +1,44 @@
+[package]
+# Package name = binary name = terminal command = config folder
+# (~/.config/iskra/): the code reads it via env!("CARGO_PKG_NAME").
+# Renaming the app comes down to editing this single line.
+name = "iskra"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "A minimal AI coding agent for the terminal (TTY), built for weak hardware"
+license = "MIT"
+
+# Standalone project: excluded from the cargo workspace of the parent folder.
+[workspace]
+
+# ---------------------------------------------------------------------------
+# Dependencies: as few crates and features as possible — for fast builds and
+# low CPU/RAM usage on old hardware.
+# ---------------------------------------------------------------------------
+[dependencies]
+# Async runtime: only the basic "rt" — the app runs on a single-threaded
+# scheduler (current_thread), without a multi-threaded worker pool.
+#   "macros" — for the #[tokio::main(flavor = "current_thread")] attribute,
+#   "time"   — for the "waiting for the model" indicator.
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "time"] }
+
+# HTTP client: JSON requests to an OpenAI-compatible API.
+# TLS is pure-Rust rustls with embedded root certificates (webpki-roots):
+# no system OpenSSL and no /etc/ssl/certs needed. Everything heavy is off by
+# default: http2, gzip/brotli, native-tls, etc.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
+
+# Serialization: configuration and JSON request bodies.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# ---------------------------------------------------------------------------
+# Release build: a small binary and minimal load on a weak CPU.
+# ---------------------------------------------------------------------------
+[profile.release]
+opt-level = "s"     # optimize for code size — cache- and weak-CPU-friendly
+lto = true          # link-time optimization — less machine code
+codegen-units = 1   # single codegen unit — a denser binary
+strip = true        # strip debug symbols
+panic = "abort"     # no stack unwinding on panic — less code
