@@ -35,13 +35,21 @@ jobs:
 
       # 64-bit: the musl linker from the Ubuntu repository.
       # 32-bit: the ready musl.cc cross-toolchain (GCC for i686-linux-musl).
+      # musl.cc is a flaky single VPS — download the GitHub mirror of the same
+      # tarball first (Actions reach github.com reliably), official site second.
       - name: Install musl toolchain
         run: |
           if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
             sudo apt-get update && sudo apt-get install -y musl-tools
           else
             mkdir -p "$HOME/musl-cross"
-            curl -fsSL https://musl.cc/i686-linux-musl-cross.tgz | tar xz -C "$HOME/musl-cross"
+            curl -fsSL --retry 3 --retry-delay 5 -o "$HOME/i686-cross.tgz" \
+              https://github.com/OpenListTeam/musl-compilers/releases/download/2025-06-12/i686-linux-musl-cross.tgz \
+            || curl -fsSL --retry 3 --retry-delay 5 -o "$HOME/i686-cross.tgz" \
+              https://musl.cc/i686-linux-musl-cross.tgz
+            tar xzf "$HOME/i686-cross.tgz" -C "$HOME/musl-cross"
+            rm -f "$HOME/i686-cross.tgz"
+            test -x "$HOME/musl-cross/i686-linux-musl-cross/bin/i686-linux-musl-gcc"
             echo "MUSL_CROSS=$HOME/musl-cross/i686-linux-musl-cross" >> "$GITHUB_ENV"
           fi
 
