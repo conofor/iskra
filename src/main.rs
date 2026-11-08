@@ -964,6 +964,42 @@ fn build_system_prompt(root: &Path, scan: &ProjectScan) -> String {
 // API request: POST {base}/chat/completions (OpenAI-compatible format)
 // ---------------------------------------------------------------------------
 
+/// Messages of all causes under the top-level error, joined with ": "
+/// ("a: b: c"). The top-level message itself is skipped: the caller prints it
+/// in its own wording (for reqwest errors we already show the URL, and the
+/// generic "error sending request for url (…)" would just repeat it). reqwest
+/// hides the real reason — DNS, TCP connect, TLS, timeout — below the top,
+/// which is exactly what one needs to see on a console-only machine. Falls
+/// back to the plain Display text when the error has no causes.
+fn error_chain(e: &impl std::error::Error) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut src = e.source();
+    while let Some(err) = src {
+        let s = err.to_string();
+        if !parts.contains(&s) {
+            parts.push(s);
+        }
+        src = err.source();
+    }
+    if parts.is_empty() {
+        e.to_string()
+    } else {
+        parts.join(": ")
+    }
+}
+
+/// Short practical hint for the two most common network-level failures,
+/// appended to the error line.
+fn net_hint(e: &reqwest::Error) -> Option<&'static str> {
+    if e.is_timeout() {
+        Some("timed out — the connection is slow or the server is unreachable")
+    } else if e.is_connect() {
+        Some("no connection — check the network and DNS, and also the system date (`date`): TLS rejects certificates when the clock is wrong")
+    } else {
+        None
+    }
+}
+
 /// Waiting phases for the progress indicator.
 const PHASE_WAIT: u8 = 0; // the first token has not arrived yet
 const PHASE_THINK: u8 = 1; // the model is streaming hidden reasoning
@@ -999,10 +1035,13 @@ async fn chat_completion(
         client.post(url.as_str()).json(&payload).bearer_auth(key)
     };
 
-    let mut response = request
-        .send()
-        .await
-        .map_err(|e| format!("API unreachable ({url}): {e}"))?;
+    let mut response = request.send().await.map_err(|e| {
+        let mut msg = format!("API unreachable ({url}): {}", error_chain(&e));
+        if let Some(hint) = net_hint(&e) {
+            msg.push_str(&format!(" — {hint}"));
+        }
+        msg
+    })?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -1011,7 +1050,7 @@ async fn chat_completion(
         let raw = response
             .bytes()
             .await
-            .map_err(|e| format!("Failed to read the API response: {e}"))?;
+            .map_err(|e| format!("Failed to read the API response: {}", error_chain(&e)))?;
         let body = String::from_utf8_lossy(&raw);
         return Err(format!(
             "API error {status}: {}",
@@ -1882,6 +1921,33 @@ mod tests {
             endpoint_url(" http://127.0.0.1:8080/v1 "),
             "http://127.0.0.1:8080/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn test_error_chain_joins_sources() {
+        #[derive(Debug)]
+        struct Root;
+        impl std::fmt::Display for Root {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "name resolution failed")
+            }
+        }
+        impl std::error::Error for Root {}
+        #[derive(Debug)]
+        struct Mid;
+        impl std::fmt::Display for Mid {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "dns error")
+            }
+        }
+        impl std::error::Error for Mid {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&Root)
+            }
+        }
+        assert_eq!(error_chain(&Mid), "name resolution failed");
+        // No source chain — fall back to the Display text.
+        assert_eq!(error_chain(&Root), "name resolution failed");
     }
 
     #[test]

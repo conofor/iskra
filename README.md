@@ -132,6 +132,11 @@ list:
 
 - The Base URL must include the API version prefix (usually `/v1`); if only
   a host is given, `/v1` is added automatically.
+- The app speaks the OpenAI **Chat Completions** protocol only, so it always
+  appends `/chat/completions` to the Base URL — for every model. The route is
+  part of the protocol, not of the model; the model itself is passed in the
+  request body (`"model": "…"`, e.g. `deepseek-ai/deepseek-v4.1-flash`).
+  Do not include `/chat/completions` in the Base URL yourself.
 - For local models (Ollama, llama.cpp) leave `api_key` empty — the request
   goes out without an `Authorization` header.
 
