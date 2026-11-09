@@ -371,18 +371,44 @@ fn read_escape<R: Read>(r: &mut R) -> Option<Esc> {
     }
 }
 
-fn render_input(start_col: usize, line: &[char], cursor: usize) {
+fn term_cols() -> usize {
+    unsafe {
+        let mut ws: libc::winsize = mem::zeroed();
+        if libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+            ws.ws_col as usize
+        } else {
+            80
+        }
+    }
+}
+
+fn pos_after(start_col: usize, cols: usize, n: usize) -> (usize, usize) {
+    let abs = (start_col - 1) + n;
+    (abs / cols, abs % cols + 1)
+}
+
+fn render_input(start_col: usize, cols: usize, line: &[char], cursor: usize, cur: &mut (usize, usize)) {
     let mut out = String::new();
-    out.push('\r');
-    let _ = write!(out, "\u{1b}[{}G", start_col);
-    out.push_str("\u{1b}[K");
+    let start = (0usize, start_col);
+    if start.0 < cur.0 {
+        let _ = write!(out, "\u{1b}[{}A", cur.0 - start.0);
+    } else if start.0 > cur.0 {
+        let _ = write!(out, "\u{1b}[{}B", start.0 - cur.0);
+    }
+    let _ = write!(out, "\u{1b}[{}G", start.1);
+    out.push_str("\u{1b}[J");
     for ch in line {
         out.push(*ch);
     }
-    let tail = line.len().saturating_sub(cursor);
-    if tail > 0 {
-        let _ = write!(out, "\u{1b}[{}D", tail);
+    *cur = pos_after(start_col, cols, line.len());
+    let target = pos_after(start_col, cols, cursor);
+    if target.0 < cur.0 {
+        let _ = write!(out, "\u{1b}[{}A", cur.0 - target.0);
+    } else if target.0 > cur.0 {
+        let _ = write!(out, "\u{1b}[{}B", target.0 - cur.0);
     }
+    let _ = write!(out, "\u{1b}[{}G", target.1);
+    *cur = target;
     print!("{out}");
     let _ = io::stdout().flush();
 }
@@ -454,13 +480,15 @@ fn raw_read_line(record_history: bool) -> Option<Option<String>> {
         }
     }
     let start_col = parse_cpr(&resp)?;
+    let cols = term_cols().max(1);
+    let mut cur = (0usize, start_col);
 
     let mut line: Vec<char> = Vec::new();
     let mut cursor = 0usize;
     let mut hist_idx: Option<usize> = None;
     let mut draft = String::new();
     let mut utf8: Vec<u8> = Vec::new();
-    render_input(start_col, &line, cursor);
+    render_input(start_col, cols, &line, cursor, &mut cur);
 
     loop {
         let n = match lock.read(&mut b) {
@@ -480,7 +508,7 @@ fn raw_read_line(record_history: bool) -> Option<Option<String>> {
                         cursor += 1;
                     }
                     utf8.clear();
-                    render_input(start_col, &line, cursor);
+                    render_input(start_col, cols, &line, cursor, &mut cur);
                 }
                 Err(e) => {
                     if e.error_len().is_some() {
@@ -514,14 +542,14 @@ fn raw_read_line(record_history: bool) -> Option<Option<String>> {
                     cursor -= 1;
                     line.remove(cursor);
                 }
-                render_input(start_col, &line, cursor);
+                render_input(start_col, cols, &line, cursor, &mut cur);
             }
             0x7f | 0x08 => {
                 if cursor > 0 {
                     cursor -= 1;
                     line.remove(cursor);
                 }
-                render_input(start_col, &line, cursor);
+                render_input(start_col, cols, &line, cursor, &mut cur);
             }
             0x1b => {
                 if let Some(esc) = read_escape(&mut lock) {
@@ -551,12 +579,12 @@ fn raw_read_line(record_history: bool) -> Option<Option<String>> {
                         }
                     }
                 }
-                render_input(start_col, &line, cursor);
+                render_input(start_col, cols, &line, cursor, &mut cur);
             }
             0x20..=0x7e => {
                 line.insert(cursor, byte as char);
                 cursor += 1;
-                render_input(start_col, &line, cursor);
+                render_input(start_col, cols, &line, cursor, &mut cur);
             }
             _ => {}
         }
