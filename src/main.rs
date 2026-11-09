@@ -1422,11 +1422,18 @@ fn build_system_prompt(root: &Path, scan: &ProjectScan) -> String {
          4. Format ordinary code examples as regular fenced blocks with the \
          language name (e.g. ```rust) — they are displayed only and change \
          nothing.\n\
-         5. Do not suggest dangerous commands (rm -rf, disk formatting, etc.) \
+         5. To look things up WITHOUT changing anything, use these blocks — \
+         they run immediately and their results are sent back to you:\n\
+         ```grep:pattern``` — substring search in all project text files\n\
+         ```glob:pattern``` — match project file paths (* and ? wildcards; \
+         a pattern without '/' also matches file names)\n\
+         ```read:path``` — show the contents of one file\n\
+         Prefer these tools over ```run for searching and reading files.\n\
+         6. Do not suggest dangerous commands (rm -rf, disk formatting, etc.) \
          unless absolutely necessary.\n\
-         6. Do not invent contents of files that are not in the context: if a \
+         7. Do not invent contents of files that are not in the context: if a \
          file appears in the tree but its contents are not shown, ask the \
-         user.\n",
+         user or read it with ```read:path```.\n",
         root = root.display()
     );
 
@@ -1607,10 +1614,13 @@ fn usage_from_value(v: &serde_json::Value) -> Option<TokenUsage> {
     })
 }
 
-/// Last `usage` object in a buffered SSE transcript (providers that honour
-/// `stream_options.include_usage` send it in a final chunk with empty choices).
-fn usage_from_sse(text: &str) -> Option<TokenUsage> {
-    let mut found = None;
+/// Metadata of a buffered SSE transcript: the last `usage` object and the
+/// last `finish_reason` (providers that honour
+/// `stream_options.include_usage` send usage in a final chunk with empty
+/// choices; `finish_reason` arrives in the last content chunk).
+fn sse_meta(text: &str) -> (Option<TokenUsage>, Option<String>) {
+    let mut usage = None;
+    let mut finish = None;
     for line in text.lines() {
         let line = line.trim();
         let Some(data) = line.strip_prefix("data:") else { continue };
@@ -1620,17 +1630,25 @@ fn usage_from_sse(text: &str) -> Option<TokenUsage> {
         }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
             if let Some(u) = usage_from_value(&v) {
-                found = Some(u);
+                usage = Some(u);
+            }
+            if let Some(fr) = v
+                .pointer("/choices/0/finish_reason")
+                .and_then(serde_json::Value::as_str)
+            {
+                finish = Some(fr.to_string());
             }
         }
     }
-    found
+    (usage, finish)
 }
 
 /// Parses a complete (non-streamed) response body: either one JSON
 /// `chat.completion` object or a buffered SSE transcript (`data:` lines).
-/// Returns the reply text and the reported token usage, if any.
-fn parse_completion_full(raw: &[u8]) -> Result<(String, Option<TokenUsage>), String> {
+/// Returns (reply text, token usage, finish_reason).
+fn parse_completion_full(
+    raw: &[u8],
+) -> Result<(String, Option<TokenUsage>, Option<String>), String> {
     let text = String::from_utf8_lossy(raw);
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -1641,19 +1659,20 @@ fn parse_completion_full(raw: &[u8]) -> Result<(String, Option<TokenUsage>), Str
             return Err(format!("API error: {err}"));
         }
         let usage = usage_from_value(&v);
-        if let Some(content) = completion_content(&v) {
-            if !content.trim().is_empty() {
-                return Ok((content, usage));
-            }
-        }
         let finish = v
             .pointer("/choices/0/finish_reason")
-            .and_then(serde_json::Value::as_str);
-        return Err(empty_reply_error(finish, false));
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        if let Some(content) = completion_content(&v) {
+            if !content.trim().is_empty() {
+                return Ok((content, usage, finish));
+            }
+        }
+        return Err(empty_reply_error(finish.as_deref(), false));
     }
     parse_sse_text(&text).map(|content| {
-        let usage = usage_from_sse(&text);
-        (content, usage)
+        let (usage, finish) = sse_meta(&text);
+        (content, usage, finish)
     })
 }
 
@@ -1661,7 +1680,7 @@ fn parse_completion_full(raw: &[u8]) -> Result<(String, Option<TokenUsage>), Str
 /// `chat.completion` object or a buffered SSE transcript (`data:` lines).
 #[cfg(test)]
 fn parse_completion_body(raw: &[u8]) -> Result<String, String> {
-    parse_completion_full(raw).map(|(content, _)| content)
+    parse_completion_full(raw).map(|(content, _, _)| content)
 }
 
 /// Parses a buffered SSE transcript without printing (fallback path).
@@ -2081,8 +2100,8 @@ const PHASE_WRITE: u8 = 2; // answer tokens are arriving (text is being rendered
 /// generated (important on slow reasoning models like gpt-oss — otherwise
 /// the user stares at an empty screen for a long time, here they see text
 /// immediately). Returns (full text, whether the reply was printed as a
-/// stream, token usage reported by the API). All errors are returned as
-/// strings: the app must not panic.
+/// stream, token usage and finish_reason reported by the API). All errors
+/// are returned as strings: the app must not panic.
 async fn chat_completion(
     client: &reqwest::Client,
     base_url: &str,
@@ -2090,7 +2109,7 @@ async fn chat_completion(
     model: &str,
     root: Option<&Path>,
     messages: &[(String, String)],
-) -> Result<(String, bool, Option<TokenUsage>), String> {
+) -> Result<(String, bool, Option<TokenUsage>, Option<String>), String> {
     let url = endpoint_url(base_url);
 
     let msgs: Vec<serde_json::Value> = messages
@@ -2150,9 +2169,9 @@ async fn chat_completion(
             .bytes()
             .await
             .map_err(|e| format!("Failed to read the API response: {}", error_chain(&e)))?;
-        return parse_completion_full(&raw).map(|(content, usage)| {
+        return parse_completion_full(&raw).map(|(content, usage, finish)| {
             let shown = print_collapsed_reply(&content, root);
-            (content, shown, usage)
+            (content, shown, usage, finish)
         });
     }
 
@@ -2187,6 +2206,7 @@ async fn chat_completion(
     let mut printed = false; // has stream printing started
     let mut stream_error: Option<String> = None;
     let mut usage: Option<TokenUsage> = None;
+    let mut finish_reason: Option<String> = None;
     let mut renderer = CollapsedRenderer::with_root(root);
 
     loop {
@@ -2215,9 +2235,16 @@ async fn chat_completion(
                             stream_error = Some(format!("API error: {err}"));
                             break;
                         }
-                        // Final usage chunk (`choices` empty, `usage` set).
+                        // Final usage chunk (`choices` empty, `usage` set)
+                        // and finish_reason on the last content chunk.
                         if let Some(u) = usage_from_value(&v) {
                             usage = Some(u);
+                        }
+                        if let Some(fr) = v
+                            .pointer("/choices/0/finish_reason")
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            finish_reason = Some(fr.to_string());
                         }
                         let delta = v.pointer("/choices/0/delta");
                         // Visible reply text — render collapsed (text live,
@@ -2286,7 +2313,7 @@ async fn chat_completion(
     // --- fallback: buffered body may be plain JSON or a non-standard SSE ---
     if content.trim().is_empty() && stream_error.is_none() {
         match parse_completion_full(&raw_body) {
-            Ok((text, u)) => {
+            Ok((text, u, f)) => {
                 if printed {
                     // Should not normally happen, but keep the transcript sane.
                     println!();
@@ -2294,6 +2321,7 @@ async fn chat_completion(
                 printed = print_collapsed_reply(&text, root);
                 content = text;
                 usage = usage.or(u);
+                finish_reason = finish_reason.or(f);
             }
             Err(e) => stream_error = Some(e),
         }
@@ -2305,11 +2333,14 @@ async fn chat_completion(
     if content.trim().is_empty() {
         return Err(empty_reply_error(None, false));
     }
-    // A stream may have ended before the usage chunk — scan the raw body once.
-    if usage.is_none() {
-        usage = usage_from_sse(&String::from_utf8_lossy(&raw_body));
+    // The stream may have ended before the usage/finish chunks — scan the
+    // raw body once for both.
+    if usage.is_none() || finish_reason.is_none() {
+        let (u, f) = sse_meta(&String::from_utf8_lossy(&raw_body));
+        usage = usage.or(u);
+        finish_reason = finish_reason.or(f);
     }
-    Ok((content, printed, usage))
+    Ok((content, printed, usage, finish_reason))
 }
 
 // ---------------------------------------------------------------------------
@@ -2336,11 +2367,36 @@ fn history_bytes(history: &[(String, String)]) -> usize {
     history.iter().map(|(r, c)| r.len() + c.len() + 8).sum()
 }
 
-/// Rough token estimate (~4 bytes per token) used when the API does not
-/// report `usage` — good enough for a progress indicator.
+/// Light context trim run before full compaction: shorten every history
+/// item except the last few. Old tool results and file dumps are the bulk
+/// of the context — cutting them keeps the recent dialog intact at a much
+/// lower information cost than summarizing everything.
+fn trim_history(history: &mut Vec<(String, String)>) {
+    const KEEP: usize = 4;
+    const CAP: usize = 800;
+    let n = history.len();
+    if n <= KEEP {
+        return;
+    }
+    for (_, content) in history.iter_mut().take(n - KEEP) {
+        if content.len() > CAP && !content.contains("[cut to fit the context]") {
+            *content = format!("{}…[cut to fit the context]", truncate_utf8(content, CAP));
+        }
+    }
+}
+
+/// Rough token estimate used when the API does not report `usage`.
+/// Quarter-token units: ASCII ≈ 4 chars/token, non-ASCII (Cyrillic, CJK)
+/// ≈ 2 chars/token — much closer to real BPE counts than bytes/4.
 fn estimate_tokens(messages: &[(String, String)]) -> u64 {
-    let bytes: usize = messages.iter().map(|(r, c)| r.len() + c.len() + 16).sum();
-    (bytes / 4) as u64
+    let mut quarter: u64 = 0;
+    for (role, content) in messages {
+        quarter += 64; // per-message overhead
+        for ch in role.chars().chain(content.chars()) {
+            quarter += if ch.is_ascii() { 1 } else { 2 };
+        }
+    }
+    quarter / 4
 }
 
 /// One-line context usage report shown above the `>` prompt: real
@@ -2413,7 +2469,7 @@ async fn compact_history(
             format!("{COMPACT_PROMPT}\n\n=== CONVERSATION HISTORY ===\n{transcript}"),
         ),
     ];
-    let (reply, _, _) =
+    let (reply, _, _, _) =
         chat_completion(client, base_url, api_key, model, None, &messages).await?;
     Ok(reply)
 }
@@ -2433,13 +2489,30 @@ enum Block {
     File { path: String, body: String },
     /// ```run — a proposal to run a command.
     Run { cmd: String },
+    /// ```grep:pattern — search file contents (read-only tool).
+    Grep { pattern: String },
+    /// ```glob:pattern — match project file paths (read-only tool).
+    Glob { pattern: String },
+    /// ```read:path — read one file (read-only tool).
+    Read { path: String },
 }
 
-/// Actions that require user confirmation.
+/// Actions that require user confirmation — except the read-only tools,
+/// which always run immediately (they cannot change anything).
 #[derive(Debug)]
 enum Action {
     WriteFile { path: String, body: String },
     RunCmd { cmd: String },
+    Grep { pattern: String },
+    Glob { pattern: String },
+    ReadFile { path: String },
+}
+
+impl Action {
+    /// Read-only tools need no confirmation and are safe in any mode.
+    fn is_readonly(&self) -> bool {
+        matches!(self, Action::Grep { .. } | Action::Glob { .. } | Action::ReadFile { .. })
+    }
 }
 
 /// Result of an applied action: a short summary for the transcript and a
@@ -2493,6 +2566,27 @@ fn classify_block(info: &str, body: &str) -> Block {
         let cmd = info[4..].trim();
         let cmd = if cmd.is_empty() { body.trim() } else { cmd };
         return Block::Run { cmd: cmd.to_string() };
+    }
+    // Read-only tools: ```grep:pat / ```glob:pat / ```read:path — the
+    // argument may also be given in the block body when the header is bare.
+    for (prefix, kind) in [("grep:", 0u8), ("grep=", 0), ("glob:", 1), ("glob=", 1), ("read:", 2), ("read=", 2)] {
+        if lower.starts_with(prefix) {
+            let arg = info[prefix.len()..].trim();
+            let arg = if arg.is_empty() { body.trim() } else { arg };
+            return match kind {
+                0 => Block::Grep { pattern: arg.to_string() },
+                1 => Block::Glob { pattern: arg.to_string() },
+                _ => Block::Read { path: arg.to_string() },
+            };
+        }
+    }
+    if lower == "grep" || lower == "glob" || lower == "read" {
+        let arg = body.trim();
+        return match lower.as_str() {
+            "grep" => Block::Grep { pattern: arg.to_string() },
+            "glob" => Block::Glob { pattern: arg.to_string() },
+            _ => Block::Read { path: arg.to_string() },
+        };
     }
     // Many models simply write ```src/main.rs — treat it as a file.
     if looks_like_path(info) {
@@ -2560,6 +2654,264 @@ fn sanitize_rel_path(raw: &str) -> Option<PathBuf> {
     Some(PathBuf::from(p))
 }
 
+/// Resolves a sanitized relative path inside `root`, following symlinks of
+/// the existing part of the path. Returns None when the resolved location
+/// escapes the working directory (e.g. a symlinked folder pointing outside).
+/// For not-yet-existing files the canonicalized parent is joined with the
+/// remaining components.
+fn resolve_in_root(root: &Path, rel: &Path) -> Option<PathBuf> {
+    let root_can = root.canonicalize().ok()?;
+    let full = root.join(rel);
+    let mut probe = full.clone();
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match probe.canonicalize() {
+            Ok(can) => {
+                if !can.starts_with(&root_can) {
+                    return None; // symlink escape
+                }
+                let mut out = can;
+                for comp in suffix.iter().rev() {
+                    out.push(comp);
+                }
+                return Some(out);
+            }
+            Err(_) => {
+                suffix.push(probe.file_name()?.to_os_string());
+                if !probe.pop() {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// Iterates project files (same skip rules as the scanner) under `root`,
+/// invoking `f` with each relative path. Stops early when `f` returns false.
+fn walk_project(root: &Path, mut f: impl FnMut(&Path) -> bool) {
+    let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if ft.is_dir() {
+                if depth >= MAX_SCAN_DEPTH {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if SKIP_DIRS.iter().any(|s| name.as_str() == *s) {
+                    continue;
+                }
+                stack.push((path, depth + 1));
+            } else if ft.is_file() {
+                let Ok(rel) = path.strip_prefix(root) else { continue };
+                if !f(rel) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Glob matcher for project paths: `*` and `?` work inside one path segment
+/// (`*` does not cross '/'), `**` matches any number of whole segments.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<&str> = pattern.split('/').collect();
+    let t: Vec<&str> = text.split('/').collect();
+    glob_segments(&p, &t)
+}
+
+fn glob_segments(p: &[&str], t: &[&str]) -> bool {
+    if p.is_empty() {
+        return t.is_empty();
+    }
+    if p[0] == "**" {
+        // `**` consumes zero or more whole segments.
+        return (0..=t.len()).any(|k| glob_segments(&p[1..], &t[k..]));
+    }
+    !t.is_empty() && seg_match(p[0], t[0]) && glob_segments(&p[1..], &t[1..])
+}
+
+/// `*`/`?` matching inside a single path segment (no '/' present).
+fn seg_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star, mut mark) = (usize::MAX, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = pi;
+            mark = ti;
+            pi += 1;
+        } else if star != usize::MAX {
+            pi = star + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// grep tool: substring search (case-insensitive with a leading `!` is not
+/// supported — keep it simple) over project text files.
+fn tool_grep(root: &Path, pattern: &str) -> ActionOutcome {
+    const MAX_MATCHES: usize = 60;
+    const MAX_LINE: usize = 200;
+    let pat = pattern.trim();
+    if pat.is_empty() {
+        return ActionOutcome {
+            summary: "error: empty grep pattern".to_string(),
+            observe: true,
+        };
+    }
+    let mut out = String::new();
+    let mut matches = 0usize;
+    let mut files = 0usize;
+    walk_project(root, |rel| {
+        files += 1;
+        let full = root.join(rel);
+        if skipped_ext(&full) || fs::metadata(&full).map(|m| m.len() > MAX_FILE_BYTES).unwrap_or(true) {
+            return true;
+        }
+        let Ok(text) = fs::read_to_string(&full) else { return true };
+        let name = rel.to_string_lossy().replace('\\', "/");
+        for (n, line) in text.lines().enumerate() {
+            if line.contains(pat) {
+                matches += 1;
+                let _ = writeln!(
+                    out,
+                    "{name}:{}: {}",
+                    n + 1,
+                    truncate_utf8(line.trim_end(), MAX_LINE)
+                );
+                if matches >= MAX_MATCHES {
+                    return false;
+                }
+            }
+        }
+        true
+    });
+    if matches == 0 {
+        ActionOutcome {
+            summary: format!("grep \"{pat}\": no matches in {files} files"),
+            observe: true,
+        }
+    } else {
+        let mut summary = format!("grep \"{pat}\": {matches} match(es)");
+        if matches >= MAX_MATCHES {
+            summary.push_str(" (limit reached)");
+        }
+        summary.push_str("\n");
+        summary.push_str(&out);
+        ActionOutcome {
+            summary: truncate_utf8(summary.trim_end(), MAX_TOOL_RESULT_BYTES).to_string(),
+            observe: true,
+        }
+    }
+}
+
+/// glob tool: match project relative paths against a wildcard pattern.
+fn tool_glob(root: &Path, pattern: &str) -> ActionOutcome {
+    const MAX_RESULTS: usize = 200;
+    let pat = pattern.trim();
+    if pat.is_empty() {
+        return ActionOutcome {
+            summary: "error: empty glob pattern".to_string(),
+            observe: true,
+        };
+    }
+    let mut hits: Vec<String> = Vec::new();
+    walk_project(root, |rel| {
+        let name = rel.to_string_lossy().replace('\\', "/");
+        let fname = rel
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // A pattern without '/' also matches the file name anywhere.
+        if glob_match(pat, &name) || (!pat.contains('/') && glob_match(pat, &fname)) {
+            hits.push(name);
+            hits.len() < MAX_RESULTS
+        } else {
+            true
+        }
+    });
+    if hits.is_empty() {
+        ActionOutcome {
+            summary: format!("glob \"{pat}\": no matches"),
+            observe: true,
+        }
+    } else {
+        let mut summary = format!("glob \"{pat}\": {} match(es)", hits.len());
+        if hits.len() >= MAX_RESULTS {
+            summary.push_str(" (limit reached)");
+        }
+        summary.push('\n');
+        summary.push_str(&hits.join("\n"));
+        ActionOutcome {
+            summary: truncate_utf8(summary.trim_end(), MAX_TOOL_RESULT_BYTES).to_string(),
+            observe: true,
+        }
+    }
+}
+
+/// read tool: return the contents of one project file (size-capped).
+fn tool_read(root: &Path, path: &str) -> ActionOutcome {
+    let Some(rel) = sanitize_rel_path(path) else {
+        return ActionOutcome {
+            summary: "error: unsafe path (absolute or contains ..)".to_string(),
+            observe: true,
+        };
+    };
+    let Some(full) = resolve_in_root(root, &rel) else {
+        return ActionOutcome {
+            summary: format!("error: {} escapes the working directory", rel.display()),
+            observe: true,
+        };
+    };
+    match fs::metadata(&full) {
+        Ok(m) if m.is_dir() => {
+            return ActionOutcome {
+                summary: format!("error: {} is a directory", rel.display()),
+                observe: true,
+            }
+        }
+        Ok(m) if m.len() > MAX_FILE_BYTES => {
+            return ActionOutcome {
+                summary: format!("error: {} is too large ({} bytes)", rel.display(), m.len()),
+                observe: true,
+            };
+        }
+        _ => {}
+    }
+    match fs::read_to_string(&full) {
+        Ok(text) => {
+            let name = rel.to_string_lossy().replace('\\', "/");
+            let mut summary = format!("--- {name} ---\n");
+            summary.push_str(truncate_utf8(&text, MAX_TOOL_RESULT_BYTES));
+            ActionOutcome {
+                summary,
+                observe: true,
+            }
+        }
+        Err(e) => ActionOutcome {
+            summary: format!("error: cannot read {}: {e}", rel.display()),
+            observe: true,
+        },
+    }
+}
+
 /// Displays the model reply: text as is, actions as compact notes.
 /// Also collects the list of actions in order of appearance.
 /// If the reply was already printed as a stream, text and ordinary blocks
@@ -2608,6 +2960,48 @@ fn render_reply(blocks: &[Block], actions: &mut Vec<Action>, streamed: bool) {
                     actions.push(Action::RunCmd { cmd: cmd.clone() });
                 }
             }
+            Block::Grep { pattern } => {
+                if !streamed {
+                    println!(
+                        "{}[⌕ grep: {pattern}]{}",
+                        col(ANSI_CYAN),
+                        col(ANSI_RESET)
+                    );
+                }
+                if !pattern.is_empty() {
+                    actions.push(Action::Grep { pattern: pattern.clone() });
+                }
+            }
+            Block::Glob { pattern } => {
+                if !streamed {
+                    println!(
+                        "{}[❋ glob: {pattern}]{}",
+                        col(ANSI_CYAN),
+                        col(ANSI_RESET)
+                    );
+                }
+                if !pattern.is_empty() {
+                    actions.push(Action::Glob { pattern: pattern.clone() });
+                }
+            }
+            Block::Read { path } => {
+                if !streamed {
+                    println!(
+                        "{}[→ read: {path}]{}",
+                        col(ANSI_CYAN),
+                        col(ANSI_RESET)
+                    );
+                }
+                match sanitize_rel_path(path) {
+                    Some(safe) => actions.push(Action::ReadFile {
+                        path: safe.to_string_lossy().to_string(),
+                    }),
+                    None => paintln(
+                        ANSI_RED,
+                        "  ⚠ unsafe path (absolute or contains ..) — skipped",
+                    ),
+                }
+            }
         }
     }
 }
@@ -2626,7 +3020,16 @@ fn apply_action(root: &Path, action: &Action) -> ActionOutcome {
                     observe: true,
                 };
             };
-            let full = root.join(&rel);
+            let Some(full) = resolve_in_root(root, &rel) else {
+                paintln(
+                    ANSI_RED,
+                    &format!("  ✗ {} escapes the working directory (symlink) — skipped", rel.display()),
+                );
+                return ActionOutcome {
+                    summary: format!("error: {} escapes the working directory", rel.display()),
+                    observe: true,
+                };
+            };
             if let Some(dir) = full.parent() {
                 if let Err(e) = fs::create_dir_all(dir) {
                     paintln(ANSI_RED, &format!("  ✗ failed to create directory {}: {e}", dir.display()));
@@ -2636,6 +3039,11 @@ fn apply_action(root: &Path, action: &Action) -> ActionOutcome {
                     };
                 }
             }
+            // Backup the current file before overwriting — /undo restores it.
+            if full.is_file() {
+                backup_file(root, &rel, &full);
+            }
+            journal(&format!("write {}", rel.display()));
             // Files conventionally end with a newline.
             let content = format!("{}\n", body.trim_end());
             match fs::write(&full, content.as_bytes()) {
@@ -2658,7 +3066,9 @@ fn apply_action(root: &Path, action: &Action) -> ActionOutcome {
                 }
             }
         }
-        Action::RunCmd { cmd } => match Command::new("sh").arg("-c").arg(cmd).current_dir(root).output() {
+        Action::RunCmd { cmd } => {
+            journal(&format!("run {cmd}"));
+            match Command::new("sh").arg("-c").arg(cmd).current_dir(root).output() {
             Ok(out) => {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let stderr = String::from_utf8_lossy(&out.stderr);
@@ -2702,7 +3112,244 @@ fn apply_action(root: &Path, action: &Action) -> ActionOutcome {
                     observe: true,
                 }
             }
-        },
+            }
+        }
+        Action::Grep { pattern } => {
+            let outcome = tool_grep(root, pattern);
+            paintln(ANSI_DIM, &format!("  ⌕ {}", truncate_utf8(&outcome.summary, 300)));
+            outcome
+        }
+        Action::Glob { pattern } => {
+            let outcome = tool_glob(root, pattern);
+            paintln(ANSI_DIM, &format!("  ❋ {}", truncate_utf8(&outcome.summary, 300)));
+            outcome
+        }
+        Action::ReadFile { path } => {
+            let outcome = tool_read(root, path);
+            paintln(ANSI_DIM, &format!("  → {}", truncate_utf8(&outcome.summary, 300)));
+            outcome
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Journal, file backups (/undo) and per-project sessions
+// ---------------------------------------------------------------------------
+
+/// Per-user data dir: $XDG_DATA_HOME/iskra or ~/.local/share/iskra
+/// (current dir as a last resort when HOME is unset).
+fn data_dir() -> PathBuf {
+    let base = env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| env::var("HOME").ok().map(|h| format!("{h}/.local/share")))
+        .unwrap_or_else(|| ".".to_string());
+    PathBuf::from(base).join(APP_NAME)
+}
+
+/// Short stable hash of a string (project path) for file names.
+fn hash_str(s: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// Appends one line to the action journal (<data>/iskra.log). Best-effort:
+/// a broken journal never breaks the agent.
+fn journal(msg: &str) {
+    let path = data_dir().join("iskra.log");
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{ts} {msg}");
+    }
+}
+
+/// Percent-encodes a relative path for a backup file name ('%'→%25, '/'→%2F).
+fn encode_rel(rel: &Path) -> String {
+    let mut out = String::new();
+    for ch in rel.to_string_lossy().chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            '/' | '\\' => out.push_str("%2F"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn decode_rel(enc: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = enc.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            match (chars.next(), chars.next()) {
+                (Some('2'), Some('5')) => out.push('%'),
+                (Some('2'), Some('F')) | (Some('2'), Some('f')) => out.push('/'),
+                _ => return None,
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
+}
+
+/// Copies `full` into the backup store before an overwrite. The file name
+/// embeds the unix timestamp, a hash of the project root and the encoded
+/// relative path, so /undo can find the newest backup of this project.
+fn backup_file(root: &Path, rel: &Path, full: &Path) {
+    let dir = data_dir().join("backups");
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let name = format!("{}-{}-{}", ts, hash_str(&root.to_string_lossy()), encode_rel(rel));
+    if fs::copy(full, dir.join(&name)).is_ok() {
+        journal(&format!("backup {}", name));
+    }
+}
+
+/// /undo: restores the newest backup of the current project. Returns a
+/// human-readable result line.
+fn undo_last_backup(root: &Path) -> String {
+    let dir = data_dir().join("backups");
+    let prefix = format!("-{}-", hash_str(&root.to_string_lossy()));
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return "No backups yet.".to_string();
+    };
+    // File names start with the unix timestamp → lexicographic = newest last.
+    let mut candidates: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            name.contains(&prefix).then(|| (name, e.path()))
+        })
+        .collect();
+    if candidates.is_empty() {
+        return "No backups for this project.".to_string();
+    }
+    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    let (name, bpath) = candidates.pop().unwrap();
+    // name = "<ts>-<hash>-<encoded rel>"; the encoded rel may itself
+    // contain '-', so split on the "-<hash>-" marker, not on the last '-'.
+    let marker = format!("-{}-", hash_str(&root.to_string_lossy()));
+    let enc = name.split(&marker).nth(1).unwrap_or("");
+    let Some(rel_str) = decode_rel(enc) else {
+        return format!("Backup {name} is corrupt — skipped.");
+    };
+    let Some(rel) = sanitize_rel_path(&rel_str) else {
+        return format!("Backup {name} has an unsafe path — skipped.");
+    };
+    let Some(full) = resolve_in_root(root, &rel) else {
+        return format!("{} escapes the working directory — skipped.", rel.display());
+    };
+    if let Some(d) = full.parent() {
+        let _ = fs::create_dir_all(d);
+    }
+    match fs::copy(&bpath, &full) {
+        Ok(_) => {
+            let _ = fs::remove_file(&bpath);
+            journal(&format!("undo {}", rel.display()));
+            format!("Restored {} from backup {name}.", rel.display())
+        }
+        Err(e) => format!("Failed to restore {}: {e}", rel.display()),
+    }
+}
+
+// --- Sessions: conversation history per project directory -----------------
+
+fn session_path(root: &Path) -> PathBuf {
+    data_dir()
+        .join("sessions")
+        .join(format!("{}.json", hash_str(&root.to_string_lossy())))
+}
+
+/// Loads the saved conversation of this project (empty when none/invalid).
+fn load_session(root: &Path) -> Vec<(String, String)> {
+    let Ok(raw) = fs::read_to_string(session_path(root)) else {
+        return Vec::new();
+    };
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+/// Saves the conversation of this project (best-effort).
+fn save_session(root: &Path, history: &[(String, String)]) {
+    let path = session_path(root);
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    if let Ok(text) = serde_json::to_string(history) {
+        let _ = fs::write(path, text);
+    }
+}
+
+fn clear_session(root: &Path) {
+    let _ = fs::remove_file(session_path(root));
+}
+
+/// /init: asks the model to analyze the project and write AGENTS.md.
+async fn cmd_init(
+    client: &reqwest::Client,
+    cfg: &Config,
+    root: &Path,
+) {
+    let scan = scan_project(root);
+    let mut prompt = String::new();
+    let _ = writeln!(
+        prompt,
+        "Analyze this project and write an AGENTS.md file for it: build/test \
+         commands, project layout, conventions and warnings for an AI coding \
+         agent. Reply with ONLY the markdown content of AGENTS.md — no code \
+         fences, no commentary.\n\nWorking directory: {}\n",
+        root.display()
+    );
+    prompt.push_str("=== PROJECT STRUCTURE ===\n");
+    for name in scan.tree.iter().take(MAX_TREE_FILES) {
+        let _ = writeln!(prompt, "- {name}");
+    }
+    prompt.push_str("\n=== FILE CONTENTS ===\n");
+    prompt.push_str(&scan.contents);
+
+    let (provider, model) = cfg.active();
+    let messages = vec![
+        (
+            "system".to_string(),
+            "You write concise AGENTS.md files for AI coding agents.".to_string(),
+        ),
+        ("user".to_string(), prompt),
+    ];
+    paintln(ANSI_CYAN, "Generating AGENTS.md…");
+    match chat_completion(client, &provider.base_url, &provider.api_key, model, Some(root), &messages).await {
+        Ok((reply, _, _, _)) => {
+            let body = reply.trim();
+            if body.is_empty() {
+                paintln(ANSI_RED, "The model returned an empty reply.");
+                return;
+            }
+            println!("\n{body}\n");
+            if !confirm("Write this content to AGENTS.md?") {
+                paintln(ANSI_YELLOW, "  — not written.");
+                return;
+            }
+            match fs::write(root.join("AGENTS.md"), format!("{body}\n")) {
+                Ok(()) => {
+                    journal("write AGENTS.md (/init)");
+                    paintln(ANSI_GREEN, "  ✓ AGENTS.md written.");
+                }
+                Err(e) => paintln(ANSI_RED, &format!("  ✗ failed to write AGENTS.md: {e}")),
+            }
+        }
+        Err(e) => paintln(ANSI_RED, &format!("Request error: {e}")),
     }
 }
 
@@ -2717,8 +3364,10 @@ fn print_help() {
     println!("  /config  — editor for providers and models (add/edit/remove)");
     println!("  /auto    — confirmation-free autopilot: /auto on|off (no argument shows the status)");
     println!("  /compact — compress the conversation history into a brief summary");
-    println!("  /clear   — clear the conversation history");
+    println!("  /clear   — clear the conversation history (and the saved session)");
     println!("  /scan    — show what the agent will see in the project context");
+    println!("  /undo    — restore the most recent file backup of this project");
+    println!("  /init    — generate an AGENTS.md for the project via the model");
     println!("  /exit    — quit (also /quit, /q, Ctrl+D; Ctrl+C exits immediately)");
     println!("File changes and commands are applied after confirmation (y/n), except in /auto mode.");
 }
@@ -2847,7 +3496,7 @@ fn print_usage() {
     println!("  --install     — install: copy itself to /usr/local/bin (as root) or to ~/.local/bin");
     println!("                    so that the \"{APP_NAME}\" command works from anywhere");
     println!("  --uninstall   — remove the installed command");
-    println!("In-session commands: /help /models /config /auto /compact /clear /scan /exit");
+    println!("In-session commands: /help /models /config /auto /compact /clear /scan /undo /init /exit");
 }
 
 fn banner(root: &Path, auto: bool) {
@@ -2897,11 +3546,16 @@ async fn agent_turn(
         };
         let mut messages = build_messages(history, &current_user);
 
-        // Auto-compaction when the request approaches the model's context
-        // window — the same compression as /compact, but automatic. Command
-        // outputs make the context grow faster inside a multi-step turn.
+        // Context budget: first a light trim of old history items, then —
+        // only if the request still approaches the window — full compaction
+        // (the same compression as /compact, but automatic).
         let limit = context_limit(provider, model);
-        let est = estimate_tokens(&messages);
+        let mut est = estimate_tokens(&messages);
+        if limit > 0 && est as f64 > limit as f64 * CONTEXT_COMPACT_RATIO {
+            trim_history(history);
+            messages = build_messages(history, &current_user);
+            est = estimate_tokens(&messages);
+        }
         if limit > 0 && est as f64 > limit as f64 * CONTEXT_COMPACT_RATIO {
             paintln(
                 ANSI_YELLOW,
@@ -2930,7 +3584,7 @@ async fn agent_turn(
         }
 
         let mut attempt = 0usize;
-        let (reply, streamed, usage) = loop {
+        let (reply, streamed, usage, finish_reason) = loop {
             match chat_completion(
                 client,
                 &provider.base_url,
@@ -2984,13 +3638,30 @@ async fn agent_turn(
         let blocks = parse_blocks(&reply);
         let mut actions: Vec<Action> = Vec::new();
         render_reply(&blocks, &mut actions, streamed);
-        *ctx_status = context_status(provider, model, usage, &messages);
+        let mode = if auto { "auto" } else { "manual" };
+        *ctx_status = format!(
+            "{}{} · {} · {}{}",
+            col(ANSI_DIM),
+            model,
+            mode,
+            context_status(provider, model, usage, &messages),
+            col(ANSI_RESET)
+        );
 
         let mut feedback: Vec<String> = Vec::new();
         let mut applied = false;
         let mut observe = false;
 
         for action in &actions {
+            // Read-only tools (grep/glob/read) run immediately — they cannot
+            // change anything, so no confirmation is needed in any mode.
+            if action.is_readonly() {
+                let outcome = apply_action(root, action);
+                applied = true;
+                observe |= outcome.observe;
+                feedback.push(outcome.summary);
+                continue;
+            }
             match action {
                 Action::WriteFile { path, .. } => {
                     let apply = if auto {
@@ -3044,6 +3715,8 @@ async fn agent_turn(
                         }
                     }
                 }
+                // Read-only tools were handled above (is_readonly).
+                _ => {}
             }
         }
 
@@ -3058,12 +3731,28 @@ async fn agent_turn(
         }
         println!();
 
-        // Continue only when an applied action produced something the model
-        // should see (command output/status, file errors). A plain successful
-        // file write is terminal and does not cost another API call.
-        if !applied || !observe {
-            break;
+        // Continue when an applied action produced something the model should
+        // see (command output/status, file errors, tool results) — or when the
+        // reply was cut off by the output limit (finish_reason=length): then
+        // ask the model to continue exactly where it stopped.
+        let mut next: Option<String> = None;
+        if applied && observe {
+            next = Some(format!("[tool results]\n{}", feedback.join("\n")));
         }
+        if finish_reason.as_deref() == Some("length") && round + 1 < MAX_AGENT_ROUNDS {
+            paintln(
+                ANSI_YELLOW,
+                "The reply hit the output limit — asking the model to continue…",
+            );
+            let note = "Your previous reply was cut off by the output limit. \
+                        Continue exactly where you stopped; do not repeat the text already sent."
+                .to_string();
+            next = Some(match next {
+                Some(t) => format!("{t}\n\n{note}"),
+                None => note,
+            });
+        }
+        let Some(next_input) = next else { break };
         if round + 1 == MAX_AGENT_ROUNDS {
             paintln(
                 ANSI_YELLOW,
@@ -3071,7 +3760,7 @@ async fn agent_turn(
             );
             break;
         }
-        pending = format!("[tool results]\n{}", feedback.join("\n"));
+        pending = next_input;
     }
 }
 
@@ -3131,8 +3820,15 @@ async fn run() -> i32 {
     };
 
     // Conversation history (user/assistant) — the system prompt is rebuilt
-    // before every request, so it is not stored in the history.
-    let mut history: Vec<(String, String)> = Vec::new();
+    // before every request, so it is not stored in the history. The dialog
+    // is saved per project directory and restored on the next launch.
+    let mut history: Vec<(String, String)> = load_session(&root);
+    if !history.is_empty() {
+        paintln(
+            ANSI_DIM,
+            &format!("Resumed the saved conversation of this project ({} messages).", history.len()),
+        );
+    }
     // Context-usage line shown above the `>` prompt (updated by agent_turn).
     let mut ctx_status = String::new();
 
@@ -3143,6 +3839,10 @@ async fn run() -> i32 {
     // --- Step 3: the main loop ---
     loop {
         if !ctx_status.is_empty() {
+            // A thin separator + status line above the prompt — the closest
+            // a scrolling terminal gets to a bottom status bar.
+            let w = term_cols().max(20);
+            println!("{}{}{}", col(ANSI_DIM), "─".repeat(w), col(ANSI_RESET));
             println!("{ctx_status}");
         }
         print!("{}{}>{} ", col(ANSI_BOLD), col(ANSI_CYAN), col(ANSI_RESET));
@@ -3166,7 +3866,16 @@ async fn run() -> i32 {
             "/clear" => {
                 history.clear();
                 ctx_status.clear();
+                clear_session(&root);
                 paintln(ANSI_GREEN, "Conversation history cleared.");
+                continue;
+            }
+            "/undo" => {
+                paintln(ANSI_CYAN, &undo_last_backup(&root));
+                continue;
+            }
+            "/init" => {
+                cmd_init(&client, &cfg, &root).await;
                 continue;
             }
             "/models" => {
@@ -3211,6 +3920,7 @@ async fn run() -> i32 {
                     }
                     Err(e) => paintln(ANSI_RED, &format!("Failed to compact the history: {e}")),
                 }
+                save_session(&root, &history);
                 continue;
             }
             s if s.starts_with("/auto") => {
@@ -3240,7 +3950,7 @@ async fn run() -> i32 {
             _ if input.starts_with('/') => {
                 paintln(
                     ANSI_YELLOW,
-                    "Unknown command. Available: /help /models /config /auto /compact /clear /scan /exit",
+                    "Unknown command. Available: /help /models /config /auto /compact /clear /scan /undo /init /exit",
                 );
                 continue;
             }
@@ -3250,6 +3960,7 @@ async fn run() -> i32 {
         // Steps 4–8 live in agent_turn: auto-compaction, fresh project scan,
         // API request, confirmed actions and action-result feedback.
         agent_turn(&client, &cfg, &root, auto, &mut history, input, &mut ctx_status).await;
+        save_session(&root, &history);
     }
 
     println!("Goodbye!");
@@ -3593,5 +4304,40 @@ mod tests {
         assert_eq!(host_of("https://integrate.api.nvidia.com/v1"), "integrate.api.nvidia.com");
         assert_eq!(host_of("http://localhost:11434/v1"), "localhost");
         assert_eq!(host_of("http://127.0.0.1:8080/v1"), "127.0.0.1");
+    }
+
+    #[test]
+    fn test_glob_match() {
+        // `*` stays inside one segment; `**` crosses directories.
+        assert!(glob_match("*.rs", "main.rs"));
+        assert!(!glob_match("*.rs", "src/main.rs"));
+        assert!(glob_match("**/*.rs", "src/main.rs"));
+        assert!(glob_match("src/*.rs", "src/lib.rs"));
+        assert!(!glob_match("src/*.rs", "src/deep/lib.rs"));
+        assert!(glob_match("src/**", "src/a/b/c"));
+        assert!(glob_match("file?.txt", "file1.txt"));
+        assert!(!glob_match("file?.txt", "file12.txt"));
+    }
+
+    #[test]
+    fn test_backup_name_roundtrip() {
+        let rel = Path::new("src/deep/my file%1.rs");
+        let enc = encode_rel(rel);
+        let dec = decode_rel(&enc).unwrap();
+        assert_eq!(dec, "src/deep/my file%1.rs");
+        assert_eq!(sanitize_rel_path(&dec).unwrap(), rel);
+    }
+
+    #[test]
+    fn test_trim_history_keeps_recent() {
+        let mut h: Vec<(String, String)> = (0..8)
+            .map(|i| ("user".to_string(), format!("msg{i} {}", "x".repeat(2000))))
+            .collect();
+        trim_history(&mut h);
+        // Last KEEP=4 items (indices 4..8) stay intact; older ones are cut.
+        assert!(h[7].1.len() > 2000);
+        assert!(h[4].1.len() > 2000);
+        assert!(h[3].1.contains("[cut to fit the context]"));
+        assert!(h[3].1.len() < 900);
     }
 }

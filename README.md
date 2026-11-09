@@ -69,7 +69,14 @@ That is why iskra runs:
 - streaming output as the reply is generated (SSE) with a
   "model is thinking… Ns" indicator;
 - conversation history compaction (`/compact`) plus automatic compaction
-  on overflow;
+  when the request approaches the model's context window;
+- read-only tools for the model — ```` ```grep:pat ````, ```` ```glob:pat ````
+  and ```` ```read:path ```` run immediately without confirmation;
+- action journal (`~/.local/share/iskra/iskra.log`), automatic file backups
+  before every overwrite and `/undo` to restore the latest one;
+- the conversation is saved per project directory and resumed on the next
+  launch;
+- `/init` generates an `AGENTS.md` for the project via the model;
 - one-command installation (`--install`) — the command becomes available
   from anywhere; removal (`--uninstall`).
 
@@ -169,8 +176,10 @@ iskra
 | `/config` | editor for providers and models |
 | `/auto on` / `off` | autopilot for the current session |
 | `/compact` | compress the conversation history into a summary |
-| `/clear` | clear the conversation history |
+| `/clear` | clear the conversation history (and the saved session) |
 | `/scan` | show what the agent will see in the project context |
+| `/undo` | restore the most recent file backup of this project |
+| `/init` | generate an `AGENTS.md` for the project via the model |
 | `/exit` | quit (`Ctrl+D` does the same; `Ctrl+C` exits immediately) |
 
 ### Command-line arguments
@@ -204,6 +213,12 @@ text plus special blocks:
   confirmation the file is fully overwritten via `std::fs`;
 - ```` ```run ```` — a terminal command; after a `y` confirmation it runs
   via `sh -c` in the working directory, output is shown to the user;
+- ```` ```grep:pattern ```` — substring search over project text files;
+- ```` ```glob:pattern ```` — match project paths (`*`/`?` inside a segment,
+  `**` across directories);
+- ```` ```read:path ```` — show the contents of one file;
+- the three tool blocks above are read-only: they run immediately without
+  confirmation and their results go back to the model;
 - ordinary code blocks (```` ```rust ```` etc.) are display-only and never
   executed.
 
