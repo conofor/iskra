@@ -33,6 +33,9 @@
 //       `run` blocks (run a command) are applied after y/n confirmation —
 //       or immediately in autopilot mode (/auto on or --yolo; dangerous
 //       commands are blocked there so the user can walk away safely).
+//       Command output/status and file errors are sent back to the model,
+//       so one request can span a few action rounds (run `top`, then write
+//       the result into a file).
 //    5. /compact compresses the conversation history into a summary; when
 //       the history overflows (> 24 KB), compaction runs automatically
 //       before the next request.
@@ -44,16 +47,17 @@
 //
 // ============================================================================
 
+use std::cell::RefCell;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::mem;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -70,15 +74,16 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// the app is a single `name = "..."` line in Cargo.toml — the code picks
 /// it up automatically.
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
-/// The old app name: only needed to migrate the config once from
-/// ~/.config/opencode/ to ~/.config/<APP_NAME>/ when upgrading.
-const LEGACY_APP_NAME: &str = "opencode";
 
 /// Overall HTTP timeout for API requests: on slow hardware local models
 /// may take minutes to generate an answer.
 const HTTP_TIMEOUT_SECS: u64 = 600;
 /// Fail fast if the server is unreachable.
 const HTTP_CONNECT_TIMEOUT_SECS: u64 = 30;
+/// Backoff between retries for transient API errors (seconds). AMD Token
+/// Factory can stay on unhealthy workers for tens of seconds, so the total
+/// retry window is ~30 s before giving up.
+const API_RETRY_DELAYS_SECS: &[u64] = &[2, 4, 8, 16];
 
 // --- Project context limits (tuned for small local models) ---
 /// Maximum number of files in the project tree listing.
@@ -97,6 +102,12 @@ const MAX_SCAN_DEPTH: usize = 10;
 const PROBE_BYTES: usize = 1024;
 
 // --- Conversation history limits (keeps the request context small) ---------
+/// Maximum number of model round-trips for one user request. After applied
+/// actions the results are sent back to the model so it can continue a
+/// multi-step task (run a command, then write its output to a file).
+const MAX_AGENT_ROUNDS: usize = 4;
+/// Cap for one action result fed back to the model (stdout+stderr+status).
+const MAX_TOOL_RESULT_BYTES: usize = 8000;
 const MAX_HISTORY_MESSAGES: usize = 12;
 const MAX_HISTORY_ITEM_BYTES: usize = 3000;
 
@@ -195,11 +206,29 @@ fn paintln(code: &'static str, text: &str) {
     println!("{}{}{}", col(code), text, col(ANSI_RESET));
 }
 
-/// Reads a line from stdin as raw bytes (up to '\n' or EOF) and decodes it.
-/// Unlike Stdin::read_line it does not fail on non-UTF-8 input (old Russian
-/// terminals send CP1251/KOI8-R) and handles Ctrl+D without a newline
-/// correctly. `None` — the input stream is closed (EOF).
+/// Reads a line from stdin and decodes it. On a TTY this is a small line
+/// editor (UTF-8 aware backspace, arrow keys, history); on a pipe it falls
+/// back to a plain canonical read. `None` — EOF (Ctrl+D / closed stream).
 fn read_line() -> Option<String> {
+    read_line_inner(false)
+}
+
+/// Same as read_line, but the submitted line is remembered so Up/Down can
+/// recall earlier input (used by the main `>` prompt).
+fn read_line_history() -> Option<String> {
+    read_line_inner(true)
+}
+
+fn read_line_inner(record_history: bool) -> Option<String> {
+    if io::stdin().is_terminal() {
+        if let Some(res) = raw_read_line(record_history) {
+            return res;
+        }
+    }
+    canonical_read_line()
+}
+
+fn canonical_read_line() -> Option<String> {
     let mut buf: Vec<u8> = Vec::new();
     let n = match io::stdin().lock().read_until(b'\n', &mut buf) {
         Ok(n) => n,
@@ -211,7 +240,6 @@ fn read_line() -> Option<String> {
     if n == 0 {
         return None; // EOF
     }
-    // Strip trailing '\n' and '\r' (including Windows-style CRLF).
     while let Some(&last) = buf.last() {
         if last == b'\n' || last == b'\r' {
             buf.pop();
@@ -219,7 +247,321 @@ fn read_line() -> Option<String> {
             break;
         }
     }
-    Some(decode_input(&buf))
+    Some(clean_input(&decode_input(&buf)))
+}
+
+thread_local! {
+    static INPUT_HISTORY: RefCell<Vec<String>> = RefCell::new(Vec::new());
+}
+
+fn history_push(line: &[char]) {
+    let s: String = line.iter().collect();
+    if s.trim().is_empty() {
+        return;
+    }
+    INPUT_HISTORY.with(|h| {
+        let mut v = h.borrow_mut();
+        if v.last() != Some(&s) {
+            v.push(s);
+            if v.len() > 200 {
+                v.remove(0);
+            }
+        }
+    });
+}
+
+fn hist_move(line: &mut Vec<char>, cursor: &mut usize, idx: &mut Option<usize>, draft: &mut String, delta: isize) {
+    INPUT_HISTORY.with(|h| {
+        let hist = h.borrow();
+        if hist.is_empty() {
+            return;
+        }
+        match *idx {
+            None => {
+                if delta < 0 {
+                    *draft = line.iter().collect();
+                    *idx = Some(hist.len() - 1);
+                    *line = hist[hist.len() - 1].chars().collect();
+                    *cursor = line.len();
+                }
+            }
+            Some(i) => {
+                if delta < 0 {
+                    if i == 0 {
+                        return;
+                    }
+                    *idx = Some(i - 1);
+                    *line = hist[i - 1].chars().collect();
+                } else if i + 1 < hist.len() {
+                    *idx = Some(i + 1);
+                    *line = hist[i + 1].chars().collect();
+                } else {
+                    *idx = None;
+                    *line = draft.chars().collect();
+                }
+                *cursor = line.len();
+            }
+        }
+    });
+}
+
+#[derive(Clone, Copy)]
+enum Esc {
+    Up,
+    Down,
+    Right,
+    Left,
+    Home,
+    End,
+    Del,
+}
+
+fn read_escape<R: Read>(r: &mut R) -> Option<Esc> {
+    let mut b = [0u8; 1];
+    if r.read(&mut b).ok()? == 0 {
+        return None;
+    }
+    match b[0] {
+        b'[' => {
+            let mut params = String::new();
+            let f;
+            loop {
+                if r.read(&mut b).ok()? == 0 {
+                    return None;
+                }
+                let c = b[0];
+                if (0x40..=0x7e).contains(&c) {
+                    f = c;
+                    break;
+                }
+                params.push(c as char);
+                if params.len() > 16 {
+                    return None;
+                }
+            }
+            Some(match f {
+                b'A' => Esc::Up,
+                b'B' => Esc::Down,
+                b'C' => Esc::Right,
+                b'D' => Esc::Left,
+                b'H' => Esc::Home,
+                b'F' => Esc::End,
+                b'~' => match params.as_str() {
+                    "3" => Esc::Del,
+                    "1" | "7" => Esc::Home,
+                    "4" | "8" => Esc::End,
+                    _ => return None,
+                },
+                _ => return None,
+            })
+        }
+        b'O' => {
+            if r.read(&mut b).ok()? == 0 {
+                return None;
+            }
+            Some(match b[0] {
+                b'A' => Esc::Up,
+                b'B' => Esc::Down,
+                b'C' => Esc::Right,
+                b'D' => Esc::Left,
+                _ => return None,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn render_input(start_col: usize, line: &[char], cursor: usize) {
+    let mut out = String::new();
+    out.push('\r');
+    let _ = write!(out, "\u{1b}[{}G", start_col);
+    out.push_str("\u{1b}[K");
+    for ch in line {
+        out.push(*ch);
+    }
+    let tail = line.len().saturating_sub(cursor);
+    if tail > 0 {
+        let _ = write!(out, "\u{1b}[{}D", tail);
+    }
+    print!("{out}");
+    let _ = io::stdout().flush();
+}
+
+struct TermiosGuard {
+    old: libc::termios,
+}
+
+impl TermiosGuard {
+    fn restore(&self) {
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, &self.old) };
+    }
+}
+
+impl Drop for TermiosGuard {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+fn parse_cpr(resp: &str) -> Option<usize> {
+    let t = resp
+        .trim_start_matches('\u{1b}')
+        .trim_start_matches('[')
+        .trim_end_matches('R');
+    t.rsplit(';').next()?.trim().parse().ok()
+}
+
+/// Raw-mode line editor. Returns `None` (outer) when raw mode cannot be set
+/// up — the caller falls back to the canonical reader.
+fn raw_read_line(record_history: bool) -> Option<Option<String>> {
+    let stdin = io::stdin();
+    let mut lock = stdin.lock();
+    let old = unsafe {
+        let mut tio: libc::termios = mem::zeroed();
+        if libc::tcgetattr(0, &mut tio) != 0 {
+            return None;
+        }
+        let old = std::ptr::read(&tio);
+        libc::cfmakeraw(&mut tio);
+        if libc::tcsetattr(0, libc::TCSANOW, &tio) != 0 {
+            return None;
+        }
+        old
+    };
+    let guard = TermiosGuard { old };
+
+    // Cursor position report → column where the input starts.
+    print!("\u{1b}[6n");
+    let _ = io::stdout().flush();
+    let mut pfd = libc::pollfd {
+        fd: 0,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    if unsafe { libc::poll(&mut pfd, 1, 200) } <= 0 || (pfd.revents & libc::POLLIN) == 0 {
+        return None;
+    }
+    let mut resp = String::new();
+    let mut b = [0u8; 1];
+    loop {
+        match lock.read(&mut b) {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => {}
+        }
+        resp.push(b[0] as char);
+        if b[0] == b'R' || resp.len() > 32 {
+            break;
+        }
+    }
+    let start_col = parse_cpr(&resp)?;
+
+    let mut line: Vec<char> = Vec::new();
+    let mut cursor = 0usize;
+    let mut hist_idx: Option<usize> = None;
+    let mut draft = String::new();
+    let mut utf8: Vec<u8> = Vec::new();
+    render_input(start_col, &line, cursor);
+
+    loop {
+        let n = match lock.read(&mut b) {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if n == 0 {
+            break; // EOF
+        }
+        let byte = b[0];
+        if byte >= 0x80 {
+            utf8.push(byte);
+            match std::str::from_utf8(&utf8) {
+                Ok(s) => {
+                    if let Some(ch) = s.chars().next() {
+                        line.insert(cursor, ch);
+                        cursor += 1;
+                    }
+                    utf8.clear();
+                    render_input(start_col, &line, cursor);
+                }
+                Err(e) => {
+                    if e.error_len().is_some() {
+                        utf8.clear();
+                    }
+                }
+            }
+            continue;
+        }
+        utf8.clear();
+        match byte {
+            b'\r' | b'\n' => {
+                print!("\r\n");
+                let _ = io::stdout().flush();
+                if record_history {
+                    history_push(&line);
+                }
+                return Some(Some(line.iter().collect()));
+            }
+            0x03 => {
+                guard.restore();
+                std::process::exit(130);
+            }
+            0x04 => {
+                if line.is_empty() {
+                    return Some(None);
+                }
+                if cursor < line.len() {
+                    line.remove(cursor);
+                } else if cursor > 0 {
+                    cursor -= 1;
+                    line.remove(cursor);
+                }
+                render_input(start_col, &line, cursor);
+            }
+            0x7f | 0x08 => {
+                if cursor > 0 {
+                    cursor -= 1;
+                    line.remove(cursor);
+                }
+                render_input(start_col, &line, cursor);
+            }
+            0x1b => {
+                if let Some(esc) = read_escape(&mut lock) {
+                    match esc {
+                        Esc::Up => {
+                            if record_history {
+                                hist_move(&mut line, &mut cursor, &mut hist_idx, &mut draft, -1)
+                            }
+                        }
+                        Esc::Down => {
+                            if record_history {
+                                hist_move(&mut line, &mut cursor, &mut hist_idx, &mut draft, 1)
+                            }
+                        }
+                        Esc::Right => {
+                            if cursor < line.len() {
+                                cursor += 1;
+                            }
+                        }
+                        Esc::Left => cursor = cursor.saturating_sub(1),
+                        Esc::Home => cursor = 0,
+                        Esc::End => cursor = line.len(),
+                        Esc::Del => {
+                            if cursor < line.len() {
+                                line.remove(cursor);
+                            }
+                        }
+                    }
+                }
+                render_input(start_col, &line, cursor);
+            }
+            0x20..=0x7e => {
+                line.insert(cursor, byte as char);
+                cursor += 1;
+                render_input(start_col, &line, cursor);
+            }
+            _ => {}
+        }
+    }
+    Some(None)
 }
 
 /// CP1251 → Unicode conversion table for bytes 0x80–0xFF (index = byte − 0x80).
@@ -236,21 +578,61 @@ const CP1251_HIGH: [char; 128] = [
 ];
 
 /// Decodes raw input bytes: strict UTF-8 first; if the input is not UTF-8,
-/// decodes it as CP1251 (the common encoding of old Russian consoles) and
-/// warns once per session. The app never crashes on input.
+/// decodes it as CP1251 (the common encoding of old Russian consoles).
+/// Russian text in UTF-8 or CP1251 is accepted silently; the app never
+/// crashes on input.
 fn decode_input(bytes: &[u8]) -> String {
     if let Ok(s) = std::str::from_utf8(bytes) {
         return s.to_string();
-    }
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        paintln(ANSI_YELLOW, "Note: input is not valid UTF-8 — decoding as CP1251.");
-        println!("  (if the terminal uses a different 8-bit encoding, e.g. KOI8-R, the text may look garbled)");
     }
     bytes
         .iter()
         .map(|&b| if b < 0x80 { b as char } else { CP1251_HIGH[(b - 0x80) as usize] })
         .collect()
+}
+
+/// Removes terminal escape sequences and control characters from a line of
+/// input. Some terminals inject focus/device-attribute reports when a program
+/// starts; without this they can land in the first answer and make a plain
+/// `y` look invalid.
+fn clean_input(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '\u{1b}' {
+            if !c.is_control() {
+                out.push(c);
+            }
+            continue;
+        }
+        match it.peek().copied() {
+            Some('[') => {
+                it.next();
+                for c2 in it.by_ref() {
+                    if ('@'..='~').contains(&c2) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                it.next();
+                while let Some(c2) = it.next() {
+                    if c2 == '\u{7}' {
+                        break;
+                    }
+                    if c2 == '\u{1b}' && it.peek() == Some(&'\\') {
+                        it.next();
+                        break;
+                    }
+                }
+            }
+            Some(_) => {
+                it.next();
+            }
+            None => {}
+        }
+    }
+    out
 }
 
 /// Asks a y/n question. An empty answer and EOF are treated as "no"
@@ -261,11 +643,14 @@ fn confirm(question: &str) -> bool {
         print!(" (y/n): ");
         let _ = io::stdout().flush();
         let Some(answer) = read_line() else { return false };
-        match answer.trim().to_lowercase().as_str() {
-            "y" | "yes" => return true,
-            "n" | "no" | "" => return false,
-            _ => println!("Enter y (yes) or n (no)."),
+        let a = answer.trim().to_lowercase();
+        if a.is_empty() || a.starts_with('n') || a.starts_with("нет") {
+            return false;
         }
+        if a.starts_with('y') || a.starts_with("да") {
+            return true;
+        }
+        println!("Enter y (yes) or n (no).");
     }
 }
 
@@ -397,17 +782,6 @@ fn config_path() -> PathBuf {
     PathBuf::from(base).join(APP_NAME).join("config.json")
 }
 
-/// Config in the OLD app-name folder (~/.config/opencode/config.json).
-/// Only used for a one-time automatic migration on upgrade.
-fn legacy_config_path() -> PathBuf {
-    let base = env::var("XDG_CONFIG_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| env::var("HOME").ok().map(|h| format!("{h}/.config")))
-        .unwrap_or_else(|| ".".to_string());
-    PathBuf::from(base).join(LEGACY_APP_NAME).join("config.json")
-}
-
 /// Short key masking for menus (first 8 characters).
 fn mask_key(key: &str) -> String {
     if key.is_empty() {
@@ -515,31 +889,11 @@ fn save_config(cfg: &Config) -> Result<(), String> {
     fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Loads the config (with old-format migration); if it is missing or damaged,
-/// runs the interactive setup. The app does not crash: without a save we
-/// keep working with the in-memory settings.
+/// Loads the config; if it is missing or damaged, runs the interactive
+/// setup. The app does not crash: without a save we keep working with the
+/// in-memory settings.
 fn load_config() -> Config {
-    let mut path = config_path();
-    if !path.exists() {
-        // Upgrade from an old version of the app: the config lived in the
-        // old-name folder (~/.config/opencode/) — move it once.
-        let legacy = legacy_config_path();
-        if legacy.exists() {
-            // The new-name folder may not exist yet — without create_dir_all
-            // the copy would fail and the config would stay at the old place.
-            if let Some(dir) = path.parent() {
-                let _ = fs::create_dir_all(dir);
-            }
-            match fs::copy(&legacy, &path) {
-                Ok(_) => paintln(
-                    ANSI_DIM,
-                    &format!("Config migrated: {} → {}", legacy.display(), path.display()),
-                ),
-                // No write permission for the new folder — read from the old place.
-                Err(_) => path = legacy,
-            }
-        }
-    }
+    let path = config_path();
     if let Ok(raw) = fs::read_to_string(&path) {
         match serde_json::from_str::<serde_json::Value>(&raw) {
             Ok(v) => match config_from_value(&v) {
@@ -911,6 +1265,9 @@ fn build_system_prompt(root: &Path, scan: &ProjectScan) -> String {
         "You are an AI programming agent running inside {APP_NAME}, a minimal \
          CLI application in the user's terminal.\n\
          Working directory: {root}\n\
+         You can read the project context below, create/modify files there and \
+         run shell commands in that directory. Commands run via `sh -c` with \
+         the working directory set to the project root.\n\
          \n\
          Reply rules (follow strictly):\n\
          1. Briefly explain what you are doing first.\n\
@@ -923,10 +1280,15 @@ fn build_system_prompt(root: &Path, scan: &ProjectScan) -> String {
          Provide the COMPLETE file content (not a diff and not a fragment): \
          the file will be fully overwritten after user confirmation. Never use \
          absolute paths or paths containing ..\n\
-         3. To suggest a terminal command, return a block:\n\
+         3. To run a terminal command, return a block:\n\
          ```run\n\
          cargo build\n\
          ```\n\
+         Confirmed commands execute in the working directory and their output \
+         is sent back to you, so you can continue multi-step tasks (for \
+         example run `top -b -n 1` and then write the result into a file). If \
+         you already know the exact shell command, you may write its output \
+         directly with redirection inside ```run.\n\
          4. Format ordinary code examples as regular fenced blocks with the \
          language name (e.g. ```rust) — they are displayed only and change \
          nothing.\n\
@@ -1000,9 +1362,532 @@ fn net_hint(e: &reqwest::Error) -> Option<&'static str> {
     }
 }
 
+// --- OpenAI-compatible response parsing ---------------------------------
+
+/// `content` may be a string or an array of typed parts
+/// (`[{"type":"text","text":"…"}]`). Returns the visible text.
+fn content_to_string(v: Option<&serde_json::Value>) -> Option<String> {
+    match v? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(parts) => {
+            let mut out = String::new();
+            for part in parts {
+                if let Some(t) = part.get("text").and_then(serde_json::Value::as_str) {
+                    out.push_str(t);
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// Text delta of a streaming chunk (`choices[0].delta.content`).
+fn delta_content(delta: &serde_json::Value) -> Option<String> {
+    content_to_string(delta.get("content"))
+}
+
+/// Final message content of a non-streaming completion.
+fn completion_content(v: &serde_json::Value) -> Option<String> {
+    v.pointer("/choices/0/message")
+        .and_then(|m| content_to_string(m.get("content")))
+}
+
+/// Extracts `error.message` (+ `code` when present) from an API error body.
+/// Handles both `{"error":{"message":…}}` and `{"error":"…"}` shapes; returns
+/// None for ordinary completion payloads.
+fn api_error_message(v: &serde_json::Value) -> Option<String> {
+    let e = v.get("error")?;
+    let message = e
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| e.as_str())
+        .unwrap_or("unknown API error");
+    let mut out = message.to_string();
+    if let Some(code) = e.get("code").and_then(serde_json::Value::as_str) {
+        if !code.is_empty() && code != "null" {
+            let _ = write!(out, " (code: {code})");
+        }
+    }
+    Some(out)
+}
+
+/// Whether a streaming delta carries hidden reasoning (`reasoning` is the
+/// field name used by AMD Token Factory; `reasoning_content` is the older
+/// OpenAI-compatible spelling).
+fn delta_has_reasoning(delta: &serde_json::Value) -> bool {
+    delta
+        .get("reasoning_content")
+        .or_else(|| delta.get("reasoning"))
+        .and_then(serde_json::Value::as_str)
+        .map_or(false, |s| !s.is_empty())
+}
+
+/// Transient upstream/gateway failures worth retrying: AMD Token Factory can
+/// flap between healthy and unhealthy workers for the same model
+/// (`no_available_workers`, HTTP 502/503, rate-limit 429). Not used for
+/// request-shape errors (400/401/404) or for streams that already printed
+/// part of the reply.
+fn is_transient_api_error(err: &str) -> bool {
+    let e = err.to_lowercase();
+    e.contains("no_available_workers")
+        || e.contains("upstream_error")
+        || e.contains("service unavailable")
+        || e.contains("bad gateway")
+        || e.contains("rate_limit")
+        || e.contains("model_concurrency")
+        || e.contains("api error 429")
+        || e.contains("api error 502")
+        || e.contains("api error 503")
+}
+
+fn empty_reply_error(finish_reason: Option<&str>, saw_reasoning: bool) -> String {
+    if finish_reason == Some("length") {
+        "The API returned an empty reply (finish_reason=length — reasoning may have used the whole token budget; try reasoning_effort=low or a larger max_tokens).".to_string()
+    } else if saw_reasoning {
+        "The API returned only reasoning and no answer (empty content).".to_string()
+    } else {
+        "The API returned an empty reply (check the model name and Base URL).".to_string()
+    }
+}
+
+/// Parses a complete (non-streamed) response body: either one JSON
+/// `chat.completion` object or a buffered SSE transcript (`data:` lines).
+fn parse_completion_body(raw: &[u8]) -> Result<String, String> {
+    let text = String::from_utf8_lossy(raw);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("The API returned an empty reply (check the model name and Base URL).".to_string());
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(err) = api_error_message(&v) {
+            return Err(format!("API error: {err}"));
+        }
+        if let Some(content) = completion_content(&v) {
+            if !content.trim().is_empty() {
+                return Ok(content);
+            }
+        }
+        let finish = v
+            .pointer("/choices/0/finish_reason")
+            .and_then(serde_json::Value::as_str);
+        return Err(empty_reply_error(finish, false));
+    }
+    parse_sse_text(&text)
+}
+
+/// Parses a buffered SSE transcript without printing (fallback path).
+fn parse_sse_text(text: &str) -> Result<String, String> {
+    let mut content = String::new();
+    let mut saw_reasoning = false;
+    let mut finish_reason: Option<String> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(data) = line.strip_prefix("data:") else { continue };
+        let data = data.trim();
+        if data == "[DONE]" || data.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else { continue };
+        if let Some(err) = api_error_message(&v) {
+            return Err(format!("API error: {err}"));
+        }
+        if let Some(delta) = v.pointer("/choices/0/delta") {
+            if let Some(t) = delta_content(delta) {
+                content.push_str(&t);
+            } else if delta_has_reasoning(delta) {
+                saw_reasoning = true;
+            }
+        }
+        if let Some(message) = v.pointer("/choices/0/message") {
+            if let Some(t) = content_to_string(message.get("content")) {
+                if content.is_empty() {
+                    content.push_str(&t);
+                }
+            }
+        }
+        if let Some(fr) = v.pointer("/choices/0/finish_reason").and_then(serde_json::Value::as_str) {
+            finish_reason = Some(fr.to_string());
+        }
+    }
+    if content.trim().is_empty() {
+        Err(empty_reply_error(finish_reason.as_deref(), saw_reasoning))
+    } else {
+        Ok(content)
+    }
+}
+
+// --- Collapsed streaming renderer ----------------------------------------
+// Prints ordinary reply text as it arrives, but turns fenced blocks into
+// one-line cards instead of dumping file contents/code into the terminal.
+
+enum RenderState {
+    Text,
+    Header,
+    Body,
+}
+
+enum FenceKind {
+    File(String),
+    Run(Option<String>),
+    Code(String),
+}
+
+fn fence_kind(info: &str) -> FenceKind {
+    let info = info.trim();
+    if info.is_empty() {
+        return FenceKind::Code(String::new());
+    }
+    let lower = info.to_lowercase();
+    if lower.starts_with("file:") || lower.starts_with("file=") {
+        return FenceKind::File(info[5..].trim().replace('\\', "/"));
+    }
+    if lower == "run" {
+        return FenceKind::Run(None);
+    }
+    if lower.starts_with("run:") || lower.starts_with("run=") {
+        let cmd = info[4..].trim();
+        return FenceKind::Run(if cmd.is_empty() { None } else { Some(cmd.to_string()) });
+    }
+    if looks_like_path(info) {
+        return FenceKind::File(info.replace('\\', "/"));
+    }
+    FenceKind::Code(info.split_whitespace().next().unwrap_or("").to_string())
+}
+
+fn truncate_display(s: &str, max: usize) -> String {
+    let t = s.trim();
+    if t.len() <= max {
+        t.to_string()
+    } else {
+        format!("{}…", truncate_utf8(t, max))
+    }
+}
+
+/// Braille spinner frames for the live activity indicator.
+const SPIN_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+fn spin_frame(i: usize) -> char {
+    SPIN_FRAMES[i % SPIN_FRAMES.len()]
+}
+
+/// Unique suffix for temporary diff files (one renderer may emit several
+/// file cards; the counter keeps names distinct within the process).
+static DIFF_TMP: AtomicUsize = AtomicUsize::new(0);
+
+/// Added/deleted line counts for a proposed file body versus the file that
+/// currently exists in the working directory. `None` means "cannot tell"
+/// (unsafe path, unreadable/binary file, missing `diff`, oversized input).
+fn diff_counts(root: &Path, rel: &str, new_body: &str) -> Option<(usize, usize)> {
+    let rel_path = sanitize_rel_path(rel)?;
+    let full = root.join(&rel_path);
+    if !full.is_file() {
+        // A new file: every line is an addition, nothing is removed.
+        return Some((new_body.lines().count(), 0));
+    }
+    // diff is a subprocess; keep it off huge inputs so streaming stays smooth.
+    if new_body.len() > 512_000 {
+        return None;
+    }
+    let old = fs::read_to_string(&full).ok()?;
+    if old.len() > 512_000 {
+        return None;
+    }
+
+    let n = DIFF_TMP.fetch_add(1, Ordering::Relaxed);
+    let tmp = env::temp_dir().join(format!("iskra-diff-{}-{n}.tmp", std::process::id()));
+    let _ = fs::write(&tmp, new_body.as_bytes());
+    let out = Command::new("diff")
+        .arg("-u")
+        .arg("--")
+        .arg(&full)
+        .arg(&tmp)
+        .output()
+        .ok();
+    let _ = fs::remove_file(&tmp);
+    let out = out?;
+    // diff exits 0 for identical files and 1 for differences; >1 is an error.
+    if !out.status.success() && out.status.code() != Some(1) {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut added = 0usize;
+    let mut deleted = 0usize;
+    let mut in_hunks = false;
+    for line in text.lines() {
+        if line.starts_with("@@") {
+            in_hunks = true;
+            continue;
+        }
+        if !in_hunks {
+            continue; // ---/+++ headers and any preamble
+        }
+        if line.starts_with('+') {
+            added += 1;
+        } else if line.starts_with('-') {
+            deleted += 1;
+        }
+    }
+    Some((added, deleted))
+}
+
+struct CollapsedRenderer {
+    state: RenderState,
+    pending: String,
+    header: String,
+    body: String,
+    kind: Option<FenceKind>,
+    body_lines: usize,
+    status_lines: usize,
+    status_mark: usize,
+    status_open: bool,
+    anim: usize,
+    status_at: Instant,
+    root: Option<PathBuf>,
+}
+
+impl CollapsedRenderer {
+    #[cfg(test)]
+    fn new() -> Self {
+        Self::with_root(None)
+    }
+
+    fn with_root(root: Option<&Path>) -> Self {
+        Self {
+            state: RenderState::Text,
+            pending: String::new(),
+            header: String::new(),
+            body: String::new(),
+            kind: None,
+            body_lines: 0,
+            status_lines: usize::MAX,
+            status_mark: 0,
+            status_open: false,
+            anim: 0,
+            status_at: Instant::now(),
+            root: root.map(Path::to_path_buf),
+        }
+    }
+
+    fn file_stats(&self) -> String {
+        let lines = self.body.lines().count();
+        if let (Some(root), Some(FenceKind::File(path))) = (self.root.as_ref(), self.kind.as_ref()) {
+            if let Some((added, deleted)) = diff_counts(root, path, &self.body) {
+                let mut s = String::new();
+                if added > 0 {
+                    let _ = write!(s, "{}+{added}{}", col(ANSI_GREEN), col(ANSI_RESET));
+                }
+                if deleted > 0 {
+                    if !s.is_empty() {
+                        s.push(' ');
+                    }
+                    let _ = write!(s, "{}-{deleted}{}", col(ANSI_RED), col(ANSI_RESET));
+                }
+                if added == 0 && deleted == 0 {
+                    s.push_str(&format!("{}unchanged{}", col(ANSI_DIM), col(ANSI_RESET)));
+                }
+                return s;
+            }
+            return format!("{}~{lines} lines{}", col(ANSI_DIM), col(ANSI_RESET));
+        }
+        format!("{}+{lines} lines{}", col(ANSI_GREEN), col(ANSI_RESET))
+    }
+
+    fn fence_card(&self) -> String {
+        let lines = self.body.lines().count();
+        match self.kind.as_ref() {
+            Some(FenceKind::File(path)) => {
+                format!("{}✎ {path}{}  {}{}\n", col(ANSI_CYAN), col(ANSI_RESET), self.file_stats(), col(ANSI_RESET))
+            }
+            Some(FenceKind::Run(cmd_hint)) => {
+                let cmd = cmd_hint
+                    .clone()
+                    .or_else(|| self.body.trim().lines().next().map(|s| s.trim().to_string()))
+                    .unwrap_or_default();
+                format!("{}▸ run:{} {}{}\n", col(ANSI_CYAN), col(ANSI_RESET), truncate_display(&cmd, 120), col(ANSI_RESET))
+            }
+            Some(FenceKind::Code(lang)) => {
+                let lang = if lang.is_empty() { "code".to_string() } else { lang.clone() };
+                format!("{}◈ {lang}{}  {lines} lines{}\n", col(ANSI_DIM), col(ANSI_RESET), col(ANSI_RESET))
+            }
+            None => String::new(),
+        }
+    }
+
+    fn status_card(&self) -> String {
+        let lines = self.body_lines;
+        let prefix = format!("{}{}{} ", col(ANSI_CYAN), spin_frame(self.anim), col(ANSI_RESET));
+        match self.kind.as_ref() {
+            Some(FenceKind::File(path)) => {
+                format!("{prefix}{}✎ {path}{}  … {lines} lines{}", col(ANSI_CYAN), col(ANSI_RESET), col(ANSI_RESET))
+            }
+            Some(FenceKind::Run(cmd_hint)) => {
+                let cmd = cmd_hint
+                    .clone()
+                    .or_else(|| self.body.lines().next().map(|s| s.trim().to_string()))
+                    .or_else(|| {
+                        let p = self.pending.trim();
+                        (!p.is_empty()).then(|| p.lines().next().unwrap_or("").trim().to_string())
+                    })
+                    .unwrap_or_else(|| "…".to_string());
+                format!("{prefix}{}▸ run:{} {} …{}", col(ANSI_CYAN), col(ANSI_RESET), truncate_display(&cmd, 120), col(ANSI_RESET))
+            }
+            Some(FenceKind::Code(lang)) => {
+                let lang = if lang.is_empty() { "code".to_string() } else { lang.clone() };
+                format!("{prefix}{}◈ {lang}{}  … {lines} lines{}", col(ANSI_DIM), col(ANSI_RESET), col(ANSI_RESET))
+            }
+            None => String::new(),
+        }
+    }
+
+    fn maybe_status(&mut self, out: &mut String) {
+        if !matches!(self.state, RenderState::Body) {
+            return;
+        }
+        let mark = self.body.len() + self.pending.len();
+        let due = self.status_lines == usize::MAX
+            || self.body_lines / 25 != self.status_lines / 25
+            || mark.saturating_sub(self.status_mark) >= 2048
+            || self.status_at.elapsed() >= Duration::from_millis(120);
+        if !due {
+            return;
+        }
+        if self.status_open {
+            out.push_str("\r\x1b[2K");
+        } else if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&self.status_card());
+        self.status_open = true;
+        self.status_lines = self.body_lines;
+        self.status_mark = mark;
+        self.status_at = Instant::now();
+        self.anim += 1;
+    }
+
+    /// Feeds a streamed delta and returns the text that should be printed now.
+    fn feed(&mut self, s: &str) -> String {
+        self.pending.push_str(s);
+        let mut out = String::new();
+        loop {
+            match self.state {
+                RenderState::Text => {
+                    if let Some(pos) = self.pending.find("```") {
+                        out.push_str(&self.pending[..pos]);
+                        self.pending.drain(..pos + 3);
+                        self.state = RenderState::Header;
+                        self.header.clear();
+                        continue;
+                    }
+                    // Keep a trailing 1–2 backticks buffered: they may be the
+                    // start of a fence split across deltas.
+                    let trailing = self.pending.len() - self.pending.trim_end_matches('`').len();
+                    let keep = trailing.min(2);
+                    let printable = self.pending.len() - keep;
+                    out.push_str(&self.pending[..printable]);
+                    self.pending.drain(..printable);
+                    break;
+                }
+                RenderState::Header => {
+                    if let Some(pos) = self.pending.find('\n') {
+                        self.header.push_str(&self.pending[..pos]);
+                        self.pending.drain(..=pos);
+                        self.kind = Some(fence_kind(&self.header));
+                        self.header.clear();
+                        self.body.clear();
+                        self.body_lines = 0;
+                        self.status_lines = usize::MAX;
+                        self.status_mark = 0;
+                        self.status_open = false;
+                        self.status_at = Instant::now();
+                        self.anim = 0;
+                        self.state = RenderState::Body;
+                        continue;
+                    }
+                    self.header.push_str(&self.pending);
+                    self.pending.clear();
+                    break;
+                }
+                RenderState::Body => {
+                    if let Some(pos) = self.pending.find('\n') {
+                        let line = self.pending[..pos].to_string();
+                        self.pending.drain(..=pos);
+                        if line.trim() == "```" {
+                            if self.status_open {
+                                out.push_str("\r\x1b[2K");
+                                self.status_open = false;
+                            }
+                            out.push_str(&self.fence_card());
+                            self.state = RenderState::Text;
+                            continue;
+                        }
+                        self.body.push_str(&line);
+                        self.body.push('\n');
+                        self.body_lines += 1;
+                        continue;
+                    }
+                    break; // partial line: wait for the rest
+                }
+            }
+        }
+        self.maybe_status(&mut out);
+        out
+    }
+
+    /// Flushes buffered text at end of stream.
+    fn finish(&mut self) -> String {
+        let mut out = String::new();
+        match self.state {
+            RenderState::Text => {
+                out.push_str(&self.pending);
+                self.pending.clear();
+            }
+            RenderState::Header => {
+                self.kind = Some(fence_kind(&self.header));
+                self.header.clear();
+                out.push_str(&self.fence_card());
+            }
+            RenderState::Body => {
+                if self.pending.trim() == "```" {
+                    self.pending.clear();
+                } else {
+                    self.body.push_str(&self.pending);
+                    self.pending.clear();
+                }
+                if self.status_open {
+                    out.push_str("\r\x1b[2K");
+                    self.status_open = false;
+                }
+                out.push_str(&self.fence_card());
+            }
+        }
+        self.state = RenderState::Text;
+        out
+    }
+}
+
+/// Prints a complete reply through the collapsed renderer (used for
+/// non-streamed/buffered bodies). Returns whether anything was shown.
+fn print_collapsed_reply(text: &str, root: Option<&Path>) -> bool {
+    let mut r = CollapsedRenderer::with_root(root);
+    let mut out = r.feed(text);
+    out.push_str(&r.finish());
+    if out.is_empty() {
+        return false;
+    }
+    print!("{out}");
+    if !out.ends_with('\n') {
+        println!();
+    }
+    let _ = io::stdout().flush();
+    true
+}
+
 /// Waiting phases for the progress indicator.
 const PHASE_WAIT: u8 = 0; // the first token has not arrived yet
 const PHASE_THINK: u8 = 1; // the model is streaming hidden reasoning
+const PHASE_WRITE: u8 = 2; // answer tokens are arriving (text is being rendered)
 
 /// One model request with SSE streaming: the reply is printed as it is
 /// generated (important on slow reasoning models like gpt-oss — otherwise
@@ -1014,6 +1899,7 @@ async fn chat_completion(
     base_url: &str,
     api_key: &str,
     model: &str,
+    root: Option<&Path>,
     messages: &[(String, String)],
 ) -> Result<(String, bool), String> {
     let url = endpoint_url(base_url);
@@ -1058,6 +1944,26 @@ async fn chat_completion(
         ));
     }
 
+    // Some compatible gateways ignore `stream: true` and answer with one JSON
+    // body (or with SSE under a non-SSE content type). Buffer those replies;
+    // parse_completion_body accepts both shapes.
+    let is_sse = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.contains("text/event-stream"))
+        .unwrap_or(false);
+    if !is_sse {
+        let raw = response
+            .bytes()
+            .await
+            .map_err(|e| format!("Failed to read the API response: {}", error_chain(&e)))?;
+        return parse_completion_body(&raw).map(|content| {
+            let shown = print_collapsed_reply(&content, root);
+            (content, shown)
+        });
+    }
+
     // --- waiting indicator: "waiting" / "thinking" + seconds ---
     // Works on the single-threaded runtime too: the task runs between
     // await points of the network request.
@@ -1072,29 +1978,29 @@ async fn chat_completion(
                 break;
             }
             ticks += 1;
-            if ticks % 5 == 0 {
-                // print once per second
-                let label = if phase2.load(Ordering::Relaxed) == PHASE_THINK {
-                    "model is thinking"
-                } else {
-                    "waiting for the model"
-                };
-                print!("\r{}{}{label}… {}s{}  ", col(ANSI_DIM), col(ANSI_CYAN), ticks / 5, col(ANSI_RESET));
-                let _ = io::stdout().flush();
-            }
+            let label = match phase2.load(Ordering::Relaxed) {
+                PHASE_THINK => "model is thinking",
+                PHASE_WRITE => "model is writing",
+                _ => "waiting for the model",
+            };
+            print!("\r{}{} {label}… {}s{}  ", col(ANSI_CYAN), spin_frame(ticks as usize), ticks / 5, col(ANSI_RESET));
+            let _ = io::stdout().flush();
         }
     });
 
     // --- read the SSE stream (lines "data: {…}") and print text deltas ---
     let mut content = String::new();
     let mut buffer: Vec<u8> = Vec::new();
+    let mut raw_body: Vec<u8> = Vec::new(); // fallback if the stream shape is odd
     let mut printed = false; // has stream printing started
     let mut stream_error: Option<String> = None;
+    let mut renderer = CollapsedRenderer::with_root(root);
 
     loop {
         match response.chunk().await {
             Ok(Some(chunk)) => {
                 buffer.extend_from_slice(&chunk);
+                raw_body.extend_from_slice(&chunk);
                 // Parse only complete lines (up to '\n').
                 while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
                     let line_bytes: Vec<u8> = buffer.drain(..=pos).collect();
@@ -1102,39 +2008,56 @@ async fn chat_completion(
                     let line = line.trim();
                     if let Some(data) = line.strip_prefix("data:") {
                         let data = data.trim();
-                        if data == "[DONE]" {
+                        if data == "[DONE]" || data.is_empty() {
                             continue;
                         }
                         let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
                             continue;
                         };
+                        // AMD Token Factory can answer HTTP 200 + SSE with an
+                        // `event: error` / `data: {"error": …}` frame (for
+                        // example upstream 503 "no_available_workers"). That
+                        // must surface as an API error, not as an empty reply.
+                        if let Some(err) = api_error_message(&v) {
+                            stream_error = Some(format!("API error: {err}"));
+                            break;
+                        }
                         let delta = v.pointer("/choices/0/delta");
-                        // Visible reply text — print immediately.
-                        if let Some(t) = delta
-                            .and_then(|d| d.get("content"))
-                            .and_then(serde_json::Value::as_str)
-                        {
+                        // Visible reply text — render collapsed (text live,
+                        // fenced blocks as one-line cards).
+                        if let Some(t) = delta.and_then(delta_content) {
                             if !t.is_empty() {
-                                if !printed {
-                                    printed = true;
-                                    stop.store(true, Ordering::Relaxed); // stop the indicator
-                                    print!("\r\x1b[2K"); // erase the indicator line
+                                phase.store(PHASE_WRITE, Ordering::Relaxed);
+                                content.push_str(&t);
+                                let out = renderer.feed(&t);
+                                if !out.is_empty() {
+                                    if !printed {
+                                        printed = true;
+                                        stop.store(true, Ordering::Relaxed); // stop the indicator
+                                        print!("\r\x1b[2K"); // erase the indicator line
+                                    }
+                                    print!("{out}");
+                                    let _ = io::stdout().flush();
                                 }
-                                print!("{t}");
-                                let _ = io::stdout().flush();
-                                content.push_str(t);
                             }
-                        } else if delta.map_or(false, |d| {
-                            d.get("reasoning_content")
-                                .or_else(|| d.get("reasoning"))
-                                .and_then(serde_json::Value::as_str)
-                                .map_or(false, |s| !s.is_empty())
-                        }) {
+                        } else if delta.map_or(false, delta_has_reasoning) {
                             // A reasoning model "thinks" into a hidden field —
                             // do not print it, only change the indicator label.
                             phase.store(PHASE_THINK, Ordering::Relaxed);
                         }
+                        // Some gateways send a complete message object even
+                        // when `stream` was requested.
+                        if let Some(message) = v.pointer("/choices/0/message") {
+                            if let Some(t) = content_to_string(message.get("content")) {
+                                if !t.is_empty() && content.is_empty() {
+                                    content.push_str(&t);
+                                }
+                            }
+                        }
                     }
+                }
+                if stream_error.is_some() {
+                    break;
                 }
             }
             Ok(None) => break, // the stream is closed by the server
@@ -1151,20 +2074,30 @@ async fn chat_completion(
 
     stop.store(true, Ordering::Relaxed);
     let _ = spinner.await;
+    let tail = renderer.finish();
+    if !tail.is_empty() {
+        if !printed {
+            printed = true;
+        }
+        print!("{tail}");
+        let _ = io::stdout().flush();
+    }
     if printed {
         println!(); // newline after the streamed reply
     }
 
-    // --- fallback: the server ignored stream=true and returned plain JSON ---
-    if content.is_empty() && stream_error.is_none() {
-        let body = String::from_utf8_lossy(&buffer);
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(body.trim()) {
-            if let Some(t) = v
-                .pointer("/choices/0/message/content")
-                .and_then(serde_json::Value::as_str)
-            {
-                content = t.to_string();
+    // --- fallback: buffered body may be plain JSON or a non-standard SSE ---
+    if content.trim().is_empty() && stream_error.is_none() {
+        match parse_completion_body(&raw_body) {
+            Ok(text) => {
+                if printed {
+                    // Should not normally happen, but keep the transcript sane.
+                    println!();
+                }
+                printed = print_collapsed_reply(&text, root);
+                content = text;
             }
+            Err(e) => stream_error = Some(e),
         }
     }
 
@@ -1172,7 +2105,7 @@ async fn chat_completion(
         return Err(err);
     }
     if content.trim().is_empty() {
-        return Err("The API returned an empty reply (check the model name and Base URL).".to_string());
+        return Err(empty_reply_error(None, false));
     }
     Ok((content, printed))
 }
@@ -1216,7 +2149,7 @@ async fn compact_history(
             format!("{COMPACT_PROMPT}\n\n=== CONVERSATION HISTORY ===\n{transcript}"),
         ),
     ];
-    let (reply, _) = chat_completion(client, base_url, api_key, model, &messages).await?;
+    let (reply, _) = chat_completion(client, base_url, api_key, model, None, &messages).await?;
     Ok(reply)
 }
 
@@ -1242,6 +2175,13 @@ enum Block {
 enum Action {
     WriteFile { path: String, body: String },
     RunCmd { cmd: String },
+}
+
+/// Result of an applied action: a short summary for the transcript and a
+/// flag telling whether the model should see it and continue the task.
+struct ActionOutcome {
+    summary: String,
+    observe: bool,
 }
 
 /// Flushes the text accumulated between blocks into the block list.
@@ -1375,13 +2315,15 @@ fn render_reply(blocks: &[Block], actions: &mut Vec<Action>, streamed: bool) {
                 }
             }
             Block::File { path, body } => {
-                println!(
-                    "{}[✎ file change suggested: {} ({} lines)]{}",
-                    col(ANSI_CYAN),
-                    path,
-                    body.lines().count(),
-                    col(ANSI_RESET)
-                );
+                if !streamed {
+                    println!(
+                        "{}[✎ file change suggested: {} ({} lines)]{}",
+                        col(ANSI_CYAN),
+                        path,
+                        body.lines().count(),
+                        col(ANSI_RESET)
+                    );
+                }
                 match sanitize_rel_path(path) {
                     Some(safe) => actions.push(Action::WriteFile {
                         path: safe.to_string_lossy().to_string(),
@@ -1394,7 +2336,9 @@ fn render_reply(blocks: &[Block], actions: &mut Vec<Action>, streamed: bool) {
                 }
             }
             Block::Run { cmd } => {
-                println!("{}[▸ command suggested: {cmd}]{}", col(ANSI_CYAN), col(ANSI_RESET));
+                if !streamed {
+                    println!("{}[▸ command suggested: {cmd}]{}", col(ANSI_CYAN), col(ANSI_RESET));
+                }
                 if !cmd.is_empty() {
                     actions.push(Action::RunCmd { cmd: cmd.clone() });
                 }
@@ -1404,29 +2348,49 @@ fn render_reply(blocks: &[Block], actions: &mut Vec<Action>, streamed: bool) {
 }
 
 /// Applies a confirmed action: file write via std::fs or command execution
-/// via sh -c (in the working directory).
-fn apply_action(root: &Path, action: &Action) {
+/// via sh -c (in the working directory). Returns a transcript summary; `observe`
+/// marks results the model should see on the next round (command output/status
+/// and file errors — successful file writes are terminal).
+fn apply_action(root: &Path, action: &Action) -> ActionOutcome {
     match action {
         Action::WriteFile { path, body } => {
             let Some(rel) = sanitize_rel_path(path) else {
                 paintln(ANSI_RED, "  ✗ unsafe path — skipped");
-                return;
+                return ActionOutcome {
+                    summary: "error: unsafe path (absolute or contains ..)".to_string(),
+                    observe: true,
+                };
             };
             let full = root.join(&rel);
             if let Some(dir) = full.parent() {
                 if let Err(e) = fs::create_dir_all(dir) {
                     paintln(ANSI_RED, &format!("  ✗ failed to create directory {}: {e}", dir.display()));
-                    return;
+                    return ActionOutcome {
+                        summary: format!("error: failed to create directory {}: {e}", dir.display()),
+                        observe: true,
+                    };
                 }
             }
             // Files conventionally end with a newline.
             let content = format!("{}\n", body.trim_end());
             match fs::write(&full, content.as_bytes()) {
-                Ok(()) => paintln(
-                    ANSI_GREEN,
-                    &format!("  ✓ file {} written ({} bytes)", rel.display(), content.len()),
-                ),
-                Err(e) => paintln(ANSI_RED, &format!("  ✗ failed to write the file: {e}")),
+                Ok(()) => {
+                    paintln(
+                        ANSI_GREEN,
+                        &format!("  ✓ file {} written ({} bytes)", rel.display(), content.len()),
+                    );
+                    ActionOutcome {
+                        summary: format!("file {} written ({} bytes)", rel.display(), content.len()),
+                        observe: false,
+                    }
+                }
+                Err(e) => {
+                    paintln(ANSI_RED, &format!("  ✗ failed to write the file: {e}"));
+                    ActionOutcome {
+                        summary: format!("error: failed to write {}: {e}", rel.display()),
+                        observe: true,
+                    }
+                }
             }
         }
         Action::RunCmd { cmd } => match Command::new("sh").arg("-c").arg(cmd).current_dir(root).output() {
@@ -1439,17 +2403,40 @@ fn apply_action(root: &Path, action: &Action) {
                 if !stderr.trim().is_empty() {
                     paintln(ANSI_YELLOW, &truncate_utf8(&stderr, 4000).to_string());
                 }
-                if let Some(code) = out.status.code() {
-                    if code == 0 {
+                let status = match out.status.code() {
+                    Some(0) => {
                         paintln(ANSI_GREEN, "  ✓ command finished (exit code 0)");
-                    } else {
-                        paintln(ANSI_RED, &format!("  ✗ command exited with code {code}"));
+                        "exit code 0".to_string()
                     }
-                } else {
-                    paintln(ANSI_RED, "  ✗ process terminated by a signal");
+                    Some(code) => {
+                        paintln(ANSI_RED, &format!("  ✗ command exited with code {code}"));
+                        format!("exit code {code}")
+                    }
+                    None => {
+                        paintln(ANSI_RED, "  ✗ process terminated by a signal");
+                        "terminated by a signal".to_string()
+                    }
+                };
+                let mut summary = String::new();
+                if !stdout.trim().is_empty() {
+                    let _ = writeln!(summary, "stdout:\n{}", truncate_utf8(&stdout, 4000));
+                }
+                if !stderr.trim().is_empty() {
+                    let _ = writeln!(summary, "stderr:\n{}", truncate_utf8(&stderr, 4000));
+                }
+                let _ = writeln!(summary, "{status}");
+                ActionOutcome {
+                    summary: truncate_utf8(summary.trim_end(), MAX_TOOL_RESULT_BYTES).to_string(),
+                    observe: true,
                 }
             }
-            Err(e) => paintln(ANSI_RED, &format!("  ✗ failed to run 'sh': {e}")),
+            Err(e) => {
+                paintln(ANSI_RED, &format!("  ✗ failed to run 'sh': {e}"));
+                ActionOutcome {
+                    summary: format!("error: failed to run 'sh': {e}"),
+                    observe: true,
+                }
+            }
         },
     }
 }
@@ -1614,6 +2601,200 @@ fn banner(root: &Path, auto: bool) {
     }
 }
 
+/// One user request, possibly spanning several model round-trips: after
+/// confirmed actions the app sends their results back so the model can
+/// continue (run `top`, then write the output into a file). History is
+/// updated inside; the project scan/system prompt is rebuilt every round.
+async fn agent_turn(
+    client: &reqwest::Client,
+    cfg: &Config,
+    root: &Path,
+    auto: bool,
+    history: &mut Vec<(String, String)>,
+    input: String,
+) {
+    let mut pending = input;
+
+    for round in 0..MAX_AGENT_ROUNDS {
+        // Auto-compaction can also trigger inside a multi-step turn: command
+        // outputs make the history grow faster than plain chat.
+        if history_bytes(history) > AUTO_COMPACT_BYTES {
+            paintln(
+                ANSI_YELLOW,
+                &format!(
+                    "The conversation history grew large ({} KB) — compacting…",
+                    history_bytes(history) / 1024
+                ),
+            );
+            let (p, model) = cfg.active();
+            match compact_history(client, &p.base_url, &p.api_key, model, history).await {
+                Ok(summary) => {
+                    *history = vec![(
+                        "user".to_string(),
+                        format!("[Compressed conversation history]\n{summary}"),
+                    )];
+                    paintln(ANSI_GREEN, "History compacted.");
+                }
+                Err(e) => paintln(ANSI_YELLOW, &format!("Compaction failed ({e}) — continuing as is.")),
+            }
+        }
+
+        let current_user = mem::take(&mut pending);
+
+        // Fresh project scan → system prompt: the model sees the current
+        // state of files, including changes made by previous rounds.
+        let scan = scan_project(root);
+        let mut messages: Vec<(String, String)> = Vec::with_capacity(history.len() + 2);
+        messages.push(("system".to_string(), build_system_prompt(root, &scan)));
+        messages.extend(history.iter().cloned());
+        messages.push(("user".to_string(), current_user.clone()));
+
+        let (provider, model) = cfg.active();
+        let mut attempt = 0usize;
+        let (reply, streamed) = loop {
+            match chat_completion(
+                client,
+                &provider.base_url,
+                &provider.api_key,
+                model,
+                Some(root),
+                &messages,
+            )
+            .await
+            {
+                Ok(r) => break r,
+                Err(e) => {
+                    // Retry only failures that happen before any reply text was
+                    // streamed; a broken stream is not safe to replay.
+                    let retryable = is_transient_api_error(&e)
+                        && !e.contains("Stream interrupted")
+                        && !e.contains("part of the reply");
+                    if retryable && attempt < API_RETRY_DELAYS_SECS.len() {
+                        let wait = API_RETRY_DELAYS_SECS[attempt];
+                        attempt += 1;
+                        paintln(
+                            ANSI_YELLOW,
+                            &format!("Transient API error — retrying in {wait}s: {e}"),
+                        );
+                        tokio::time::sleep(Duration::from_secs(wait)).await;
+                        continue;
+                    }
+                    // Record the failed attempt so a follow-up like "continue"
+                    // does not make the model assume the shown (but unapplied)
+                    // file/run cards already changed the project.
+                    history.push(("user".to_string(), current_user));
+                    history.push((
+                        "assistant".to_string(),
+                        format!(
+                            "[request failed: {e}. The reply was not completed; no file or command actions from it were applied.]"
+                        ),
+                    ));
+                    while history.len() > MAX_HISTORY_MESSAGES {
+                        history.remove(0);
+                    }
+                    paintln(
+                        ANSI_RED,
+                        &format!("Request error: {e} — nothing from this reply was applied."),
+                    );
+                    return; // no crash: let the user retry the request
+                }
+            }
+        };
+
+        // Parse the reply and run the proposed actions.
+        let blocks = parse_blocks(&reply);
+        let mut actions: Vec<Action> = Vec::new();
+        render_reply(&blocks, &mut actions, streamed);
+
+        let mut feedback: Vec<String> = Vec::new();
+        let mut applied = false;
+        let mut observe = false;
+
+        for action in &actions {
+            match action {
+                Action::WriteFile { path, .. } => {
+                    let apply = if auto {
+                        true // autopilot: no questions
+                    } else {
+                        confirm(&format!(
+                            "The AI wants to modify the file [{path}]. Apply the changes?"
+                        ))
+                    };
+                    if apply {
+                        if auto {
+                            paintln(ANSI_CYAN, &format!("[auto] writing file {path}"));
+                        }
+                        let outcome = apply_action(root, action);
+                        applied = true;
+                        observe |= outcome.observe;
+                        feedback.push(format!("file {path}: {}", outcome.summary));
+                    } else {
+                        paintln(ANSI_YELLOW, "  — change rejected.");
+                        feedback.push(format!("file {path}: rejected by user"));
+                    }
+                }
+                Action::RunCmd { cmd } => {
+                    if auto && is_dangerous(cmd) {
+                        // In autopilot, dangerous commands are not asked about
+                        // but blocked: the user may be away from the computer.
+                        paintln(
+                            ANSI_RED,
+                            &format!("[auto] ✗ command blocked as dangerous: {cmd}"),
+                        );
+                        feedback.push(format!("run `{cmd}`: blocked as dangerous"));
+                    } else {
+                        let apply = if auto {
+                            true
+                        } else {
+                            confirm(&format!(
+                                "The AI wants to run the command [{cmd}]. Run it?"
+                            ))
+                        };
+                        if apply {
+                            if auto {
+                                paintln(ANSI_CYAN, &format!("[auto] running: {cmd}"));
+                            }
+                            let outcome = apply_action(root, action);
+                            applied = true;
+                            observe |= outcome.observe;
+                            feedback.push(format!("run `{cmd}`: {}", outcome.summary));
+                        } else {
+                            paintln(ANSI_YELLOW, "  — command rejected.");
+                            feedback.push(format!("run `{cmd}`: rejected by user"));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Remember the dialog (long replies are truncated).
+        history.push(("user".to_string(), current_user));
+        history.push((
+            "assistant".to_string(),
+            truncate_utf8(&reply, MAX_HISTORY_ITEM_BYTES).to_string(),
+        ));
+        while history.len() > MAX_HISTORY_MESSAGES {
+            history.remove(0);
+        }
+        println!();
+
+        // Continue only when an applied action produced something the model
+        // should see (command output/status, file errors). A plain successful
+        // file write is terminal and does not cost another API call.
+        if !applied || !observe {
+            break;
+        }
+        if round + 1 == MAX_AGENT_ROUNDS {
+            paintln(
+                ANSI_YELLOW,
+                &format!("Stopped after {MAX_AGENT_ROUNDS} action rounds — continuing is up to you."),
+            );
+            break;
+        }
+        pending = format!("[tool results]\n{}", feedback.join("\n"));
+    }
+}
+
 /// Returns the process exit code: 0 — normal, 1 — refusal/error.
 async fn run() -> i32 {
     // --- command-line arguments ---
@@ -1681,7 +2862,7 @@ async fn run() -> i32 {
     loop {
         print!("{}{}>{} ", col(ANSI_BOLD), col(ANSI_CYAN), col(ANSI_RESET));
         let _ = io::stdout().flush();
-        let Some(raw_input) = read_line() else {
+        let Some(raw_input) = read_line_history() else {
             println!();
             break; // EOF (Ctrl+D) — a graceful exit
         };
@@ -1780,111 +2961,9 @@ async fn run() -> i32 {
             _ => {}
         }
 
-        // --- Step 4: auto-compaction if the history overflowed its budget ---
-        if history_bytes(&history) > AUTO_COMPACT_BYTES {
-            paintln(
-                ANSI_YELLOW,
-                &format!(
-                    "The conversation history grew large ({} KB) — compacting…",
-                    history_bytes(&history) / 1024
-                ),
-            );
-            let (p, model) = cfg.active();
-            match compact_history(&client, &p.base_url, &p.api_key, model, &history).await {
-                Ok(summary) => {
-                    history =
-                        vec![("user".to_string(), format!("[Compressed conversation history]\n{summary}"))];
-                    paintln(ANSI_GREEN, "History compacted.");
-                }
-                Err(e) => paintln(ANSI_YELLOW, &format!("Compaction failed ({e}) — continuing as is.")),
-            }
-        }
-
-        // --- Step 5: fresh project scan → system prompt ---
-        // The context is rebuilt before EVERY request so the model sees the
-        // current state of the files (including agent-made changes).
-        let scan = scan_project(&root);
-        let mut messages: Vec<(String, String)> = Vec::with_capacity(history.len() + 2);
-        messages.push(("system".to_string(), build_system_prompt(&root, &scan)));
-        messages.extend(history.iter().cloned());
-        messages.push(("user".to_string(), input.clone()));
-
-        // --- Step 6: request to the active provider/model ---
-        let (provider, model) = cfg.active();
-        let (reply, streamed) = match chat_completion(
-            &client,
-            &provider.base_url,
-            &provider.api_key,
-            model,
-            &messages,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                paintln(ANSI_RED, &format!("Request error: {e}"));
-                continue; // no crash: let the user retry the request
-            }
-        };
-
-        // --- Step 7: parse the reply and run the proposed actions ---
-        let blocks = parse_blocks(&reply);
-        let mut actions: Vec<Action> = Vec::new();
-        render_reply(&blocks, &mut actions, streamed);
-
-        for action in &actions {
-            match action {
-                Action::WriteFile { path, .. } => {
-                    let apply = if auto {
-                        true // autopilot: no questions
-                    } else {
-                        confirm(&format!(
-                            "The AI wants to modify the file [{path}]. Apply the changes?"
-                        ))
-                    };
-                    if apply {
-                        if auto {
-                            paintln(ANSI_CYAN, &format!("[auto] writing file {path}"));
-                        }
-                        apply_action(&root, action);
-                    } else {
-                        paintln(ANSI_YELLOW, "  — change rejected.");
-                    }
-                }
-                Action::RunCmd { cmd } => {
-                    if auto {
-                        // In autopilot, dangerous commands are not asked about
-                        // but blocked: the user may be away from the computer.
-                        if is_dangerous(cmd) {
-                            paintln(
-                                ANSI_RED,
-                                &format!("[auto] ✗ command blocked as dangerous: {cmd}"),
-                            );
-                        } else {
-                            paintln(ANSI_CYAN, &format!("[auto] running: {cmd}"));
-                            apply_action(&root, action);
-                        }
-                    } else if confirm(&format!(
-                        "The AI wants to run the command [{cmd}]. Run it?"
-                    )) {
-                        apply_action(&root, action);
-                    } else {
-                        paintln(ANSI_YELLOW, "  — command rejected.");
-                    }
-                }
-            }
-        }
-
-        // --- Step 8: remember the dialog (long replies are truncated) ---
-        history.push(("user".to_string(), input));
-        history.push((
-            "assistant".to_string(),
-            truncate_utf8(&reply, MAX_HISTORY_ITEM_BYTES).to_string(),
-        ));
-        while history.len() > MAX_HISTORY_MESSAGES {
-            history.remove(0);
-        }
-        println!();
+        // Steps 4–8 live in agent_turn: auto-compaction, fresh project scan,
+        // API request, confirmed actions and action-result feedback.
+        agent_turn(&client, &cfg, &root, auto, &mut history, input).await;
     }
 
     println!("Goodbye!");
@@ -1951,6 +3030,105 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_completion_body_json() {
+        let body = br#"{"choices":[{"message":{"role":"assistant","content":[{"type":"text","text":"Hel"},{"type":"text","text":"lo"}]},"finish_reason":"stop"}]}"#;
+        assert_eq!(parse_completion_body(body).unwrap(), "Hello");
+
+        let err = br#"{"error":{"message":"Requested model X not supported","type":"invalid_request_error","code":"unsupported_model"}}"#;
+        let e = parse_completion_body(err).unwrap_err();
+        assert!(e.contains("Requested model X not supported"));
+        assert!(e.contains("unsupported_model"));
+    }
+
+    #[test]
+    fn test_parse_completion_body_sse_error() {
+        // Shape returned by AMD Token Factory on upstream 503: HTTP 200 +
+        // `event: error` frame followed by `data: [DONE]`.
+        let body = "event: error\n\
+                    data: {\"error\":{\"message\":\"Error from provider self-dploy: 503 Service Unavailable {\\\"error\\\":{\\\"code\\\":\\\"no_available_workers\\\"}}\",\"type\":\"upstream_error\",\"code\":\"upstream_error\"}}\n\
+                    id: 0\n\
+                    event: done\n\
+                    data: [DONE]\n\
+                    id: 1\n";
+        let e = parse_completion_body(body.as_bytes()).unwrap_err();
+        assert!(e.contains("API error"));
+        assert!(e.contains("no_available_workers"));
+    }
+
+    #[test]
+    fn test_parse_completion_body_sse_content() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\
+                    data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\
+                    data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\
+                    data: [DONE]\n";
+        assert_eq!(parse_completion_body(body.as_bytes()).unwrap(), "Hello");
+    }
+
+    #[test]
+    fn test_is_transient_api_error() {
+        assert!(is_transient_api_error(
+            "API error: Error from provider self-dploy: 503 Service Unavailable {\"code\":\"no_available_workers\"} (code: upstream_error)"
+        ));
+        assert!(is_transient_api_error("API error 429 Too Many Requests: rate_limit_error"));
+        assert!(is_transient_api_error("API error 503: bad gateway"));
+        assert!(!is_transient_api_error("API error 400: Requested model X not supported"));
+        assert!(!is_transient_api_error("API error 401: invalid key"));
+        assert!(!is_transient_api_error("Stream interrupted: boom (part of the reply was already shown)"));
+    }
+
+    #[test]
+    fn test_empty_reply_error_length() {
+        let e = empty_reply_error(Some("length"), false);
+        assert!(e.contains("finish_reason=length"));
+        let e = empty_reply_error(None, true);
+        assert!(e.contains("only reasoning"));
+    }
+
+    #[test]
+    fn test_collapsed_renderer() {
+        let mut r = CollapsedRenderer::new();
+        // Split a fence across deltas; body must not leak into output.
+        let out = r.feed("Hello\n```fi");
+        assert_eq!(out, "Hello\n");
+        let out = r.feed("le:index.html\n<body>secret</body>\n```\n");
+        assert!(out.contains("✎ index.html"));
+        assert!(out.contains("+1 lines"));
+        assert!(!out.contains("secret"));
+        let out = r.feed("After\n```rust\nlet x=1;\n```\nDone");
+        assert!(out.contains("◈ rust"));
+        assert!(out.contains("Done"));
+        assert!(!out.contains("let x=1"));
+        assert_eq!(r.finish(), "");
+    }
+
+    #[test]
+    fn test_collapsed_renderer_file_stats() {
+        let root = env::temp_dir().join(format!("iskra-test-stats-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+
+        let mut r = CollapsedRenderer::with_root(Some(&root));
+        // A live status line appears as soon as the fence body starts.
+        let out = r.feed("```file:a.txt\n");
+        assert!(out.contains('⠋'));
+        assert!(out.contains("… 0 lines"));
+
+        let out = r.feed("one\nTWO\nfour\n```\n");
+        assert!(out.contains("✎ a.txt"));
+        assert!(out.contains("+2"));
+        assert!(out.contains("-2"));
+        assert!(!out.contains("TWO"));
+
+        let out = r.feed("```file:new.txt\nalpha\nbeta\n```\n");
+        assert!(out.contains("✎ new.txt"));
+        assert!(out.contains("+2"));
+        assert!(!out.contains("-0"));
+        assert!(!out.contains("beta"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn test_parse_blocks() {
         let reply = "Text before\n\
                      ```file:src/a.rs\nfn main() {}\n```\n\
@@ -2005,6 +3183,29 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_action_outcomes() {
+        let root = env::temp_dir().join(format!("iskra-test-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+
+        let out = apply_action(
+            &root,
+            &Action::RunCmd { cmd: "printf 'hello-output'".to_string() },
+        );
+        assert!(out.observe);
+        assert!(out.summary.contains("hello-output"));
+        assert!(out.summary.contains("exit code 0"));
+
+        let out = apply_action(
+            &root,
+            &Action::WriteFile { path: "nested/file.txt".to_string(), body: "body".to_string() },
+        );
+        assert!(!out.observe);
+        assert_eq!(fs::read_to_string(root.join("nested/file.txt")).unwrap(), "body\n");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn test_looks_like_path() {
         assert!(looks_like_path("src/main.rs"));
         assert!(looks_like_path("README.md"));
@@ -2034,6 +3235,18 @@ mod tests {
         // mixed input: ASCII + CP1251
         assert_eq!(decode_input(b"file: " as &[u8]), "file: ");
         assert_eq!(decode_input(&[b'1', b'.', b't', b'x', b't']), "1.txt");
+    }
+
+    #[test]
+    fn test_clean_input() {
+        // focus-in report before a plain answer
+        assert_eq!(clean_input("\u{1b}[Iy"), "y");
+        // device-attributes response after the answer
+        assert_eq!(clean_input("y\u{1b}[?1;2c"), "y");
+        // control characters are dropped
+        assert_eq!(clean_input("y\u{7}n"), "yn");
+        // ordinary text is untouched
+        assert_eq!(clean_input("да, создай файл"), "да, создай файл");
     }
 
     #[test]

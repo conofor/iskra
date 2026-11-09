@@ -197,6 +197,20 @@ text plus special blocks:
 - ordinary code blocks (```` ```rust ```` etc.) are display-only and never
   executed.
 
+Confirmed actions are executed in the working directory and their results
+(command output/status, file errors) are sent back to the model, so it can
+continue a multi-step task — for example run `top -b -n 1` and then write
+the result into a file. This feedback loop is bounded to a few rounds per
+request.
+
+Replies are streamed live, but fenced blocks are collapsed instead of dumped:
+```` ```file:path ```` becomes a one-line `✎ path (+A -D)` card (green additions,
+red deletions, computed against the current file), ```` ```run ````
+a `▸ run: …` card, and ordinary code blocks a `◈ lang (N lines)` card, so file
+bodies and code do not flood the terminal. A spinner animates while a block is
+still being generated. Actions are still confirmed one by one before being
+applied.
+
 ## Context limits
 
 On weak hardware and for small models the context is bounded by constants at
