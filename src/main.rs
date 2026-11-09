@@ -37,8 +37,8 @@
 //       so one request can span a few action rounds (run `top`, then write
 //       the result into a file).
 //    5. /compact compresses the conversation history into a summary; when
-//       the history overflows (> 24 KB), compaction runs automatically
-//       before the next request.
+//       the request approaches 80% of the model's context window, compaction
+//       runs automatically before the next request.
 //
 //  Reply format of the model (protocol, also described in the system prompt):
 //    ```file:path/to/file   → full new file content
@@ -2322,6 +2322,15 @@ fn is_dangerous(cmd: &str) -> bool {
     DANGEROUS_CMD.iter().any(|p| c.contains(p))
 }
 
+/// Human-readable byte size: "512 B" under 1 KB, "1.5 KB" above.
+fn fmt_bytes(n: usize) -> String {
+    if n < 1024 {
+        format!("{n} B")
+    } else {
+        format!("{:.1} KB", n as f64 / 1024.0)
+    }
+}
+
 /// Size of the conversation history in bytes (an estimate for auto-compaction).
 fn history_bytes(history: &[(String, String)]) -> usize {
     history.iter().map(|(r, c)| r.len() + c.len() + 8).sum()
@@ -3171,10 +3180,10 @@ async fn run() -> i32 {
             "/scan" => {
                 let scan = scan_project(&root);
                 println!(
-                    "Files in project: {}. Included in context: {} ({} KB, truncated: {}).",
+                    "Files in project: {}. Included in context: {} ({}, truncated: {}).",
                     scan.tree.len(),
                     scan.scanned,
-                    scan.contents.len() / 1024,
+                    fmt_bytes(scan.contents.len()),
                     scan.truncated
                 );
                 continue;
@@ -3194,9 +3203,9 @@ async fn run() -> i32 {
                         paintln(
                             ANSI_GREEN,
                             &format!(
-                                "History compacted: {} KB → {} KB.",
-                                before / 1024,
-                                history_bytes(&history) / 1024
+                                "History compacted: {} → {}.",
+                                fmt_bytes(before),
+                                fmt_bytes(history_bytes(&history))
                             ),
                         );
                     }
