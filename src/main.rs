@@ -48,6 +48,7 @@
 // ============================================================================
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
@@ -111,11 +112,18 @@ const MAX_TOOL_RESULT_BYTES: usize = 8000;
 const MAX_HISTORY_MESSAGES: usize = 12;
 const MAX_HISTORY_ITEM_BYTES: usize = 3000;
 
-/// Auto-compaction threshold for the conversation history (bytes): when
-/// exceeded, the history is compressed into a summary before the next
-/// request — important in autopilot mode where the agent may run long and
-/// unattended.
-const AUTO_COMPACT_BYTES: usize = 24 * 1024;
+/// Context window assumed for a model when the user did not set one
+/// (`model_contexts` in the config). 250k tokens covers most modern models.
+const DEFAULT_CONTEXT_TOKENS: u64 = 250_000;
+
+/// Context window of a model in tokens: the configured value or the default.
+fn context_limit(p: &Provider, model: &str) -> u64 {
+    model_context(p, model).unwrap_or(DEFAULT_CONTEXT_TOKENS)
+}
+
+/// Auto-compact runs when the estimated request size reaches this share of
+/// the model's context window.
+const CONTEXT_COMPACT_RATIO: f64 = 0.8;
 
 /// Instruction for the model to compress the history (/compact and
 /// auto-compaction).
@@ -718,6 +726,9 @@ struct Provider {
     api_key: String,
     /// Models the user added for this provider.
     models: Vec<String>,
+    /// Context window per model name, in tokens (empty = unknown).
+    #[serde(default)]
+    model_contexts: HashMap<String, u64>,
 }
 
 /// Configuration: several providers, each with several models.
@@ -794,6 +805,7 @@ fn config_from_value(v: &serde_json::Value) -> Option<Config> {
             base_url,
             api_key,
             models: vec![model],
+            model_contexts: HashMap::new(),
         }],
     })
 }
@@ -808,6 +820,53 @@ fn config_path() -> PathBuf {
         .or_else(|| env::var("HOME").ok().map(|h| format!("{h}/.config")))
         .unwrap_or_else(|| ".".to_string());
     PathBuf::from(base).join(APP_NAME).join("config.json")
+}
+
+/// Context window of a model in tokens, if the user set one.
+fn model_context(p: &Provider, model: &str) -> Option<u64> {
+    p.model_contexts.get(model).copied()
+}
+
+/// Parses a context-window input: "128000", "128k", "1M" (empty/invalid → None).
+fn parse_context_input(s: &str) -> Option<u64> {
+    let s = s.trim().to_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    let (num, mult) = if let Some(n) = s.strip_suffix('k') {
+        (n, 1_000u64)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 1_000_000u64)
+    } else {
+        (s.as_str(), 1u64)
+    };
+    let n: f64 = num.trim().parse().ok()?;
+    if n <= 0.0 {
+        return None;
+    }
+    Some((n * mult as f64) as u64)
+}
+
+/// Asks for the context window of a model; Enter keeps it unknown.
+fn prompt_model_context(model: &str) -> Option<u64> {
+    let s = prompt_line(&format!(
+        "Context window of \"{model}\" in tokens (Enter = unknown, e.g. 128000 or 128k):"
+    ))
+    .unwrap_or_default();
+    parse_context_input(&s)
+}
+
+/// Compact token count for display: 999, 12.3k, 128k, 1M.
+fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 10_000 {
+        format!("{}k", n / 1000)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
 }
 
 /// Short key masking for menus (first 8 characters).
@@ -857,6 +916,7 @@ fn prompt_provider(default_name: &str) -> Provider {
 
     // At least one model is required; more until an empty line.
     let mut models: Vec<String> = Vec::new();
+    let mut contexts: HashMap<String, u64> = HashMap::new();
     println!("Enter the models of this provider (an empty line finishes):");
     loop {
         let label = if models.is_empty() {
@@ -880,6 +940,9 @@ fn prompt_provider(default_name: &str) -> Provider {
             println!("  This model is already added.");
             continue;
         }
+        if let Some(ctx) = prompt_model_context(&m) {
+            contexts.insert(m.clone(), ctx);
+        }
         models.push(m);
     }
 
@@ -888,6 +951,7 @@ fn prompt_provider(default_name: &str) -> Provider {
         base_url,
         api_key: api_key.trim().to_string(),
         models,
+        model_contexts: contexts,
     }
 }
 
@@ -984,7 +1048,10 @@ fn models_menu(cfg: &mut Config) {
     for (n, (pi, m)) in all.iter().enumerate() {
         let cur = *pi == cfg.active_provider && *m == cfg.active_model;
         let mark = if cur { "  ← current" } else { "" };
-        println!(" {}. {} — {} ({}){}", n + 1, cfg.providers[*pi].name, m, cfg.providers[*pi].base_url, mark);
+        let ctx = model_context(&cfg.providers[*pi], m)
+            .map(|c| format!(" | ctx: {}", fmt_tokens(c)))
+            .unwrap_or_default();
+        println!(" {}. {} — {} ({}){}{}", n + 1, cfg.providers[*pi].name, m, cfg.providers[*pi].base_url, ctx, mark);
     }
     if let Some(idx) = prompt_index("Model number (Enter to cancel): ", all.len()) {
         let (pi, m) = all[idx].clone();
@@ -1020,12 +1087,15 @@ fn config_menu(cfg: &mut Config) {
             for (j, m) in p.models.iter().enumerate() {
                 let cur = i == cfg.active_provider && *m == cfg.active_model;
                 let mark = if cur { "  ← current" } else { "" };
-                println!("      {j}. {m}{mark}");
+                let ctx = model_context(p, m)
+                    .map(|c| format!(" | ctx: {}", fmt_tokens(c)))
+                    .unwrap_or_default();
+                println!("      {j}. {m}{ctx}{mark}");
             }
         }
         println!();
         println!("[a] add provider      [e] edit provider      [d] remove provider");
-        println!("[m] add model         [x] remove model       [q] done");
+        println!("[m] add model         [x] remove model       [c] model context   [q] done");
         let Some(cmd) = prompt_line("[config]:") else { break };
         match cmd.trim().to_lowercase().as_str() {
             "q" | "" => break,
@@ -1086,6 +1156,9 @@ fn config_menu(cfg: &mut Config) {
                         } else if cfg.providers[i].models.contains(&m) {
                             paintln(ANSI_YELLOW, "That model already exists.");
                         } else {
+                            if let Some(ctx) = prompt_model_context(&m) {
+                                cfg.providers[i].model_contexts.insert(m.clone(), ctx);
+                            }
                             cfg.providers[i].models.push(m);
                             paintln(ANSI_GREEN, "Model added.");
                         }
@@ -1104,6 +1177,7 @@ fn config_menu(cfg: &mut Config) {
                     }
                     if let Some(k) = prompt_index("Model number: ", models.len()) {
                         let removed = cfg.providers[i].models.remove(k);
+                        cfg.providers[i].model_contexts.remove(&removed);
                         if i == cfg.active_provider && cfg.active_model == removed {
                             cfg.active_model = cfg.providers[i].models[0].clone();
                         }
@@ -1111,7 +1185,35 @@ fn config_menu(cfg: &mut Config) {
                     }
                 }
             }
-            _ => paintln(ANSI_YELLOW, "Unknown menu command (a/e/d/m/x/q)."),
+            "c" => {
+                if let Some(i) = prompt_index("Provider number: ", cfg.providers.len()) {
+                    let models = cfg.providers[i].models.clone();
+                    for (j, m) in models.iter().enumerate() {
+                        let cur = model_context(&cfg.providers[i], m)
+                            .map(|c| format!(" ({})", fmt_tokens(c)))
+                            .unwrap_or_default();
+                        println!("  {}. {m}{cur}", j + 1);
+                    }
+                    if let Some(k) = prompt_index("Model number: ", models.len()) {
+                        let m = models[k].clone();
+                        let s = prompt_line(&format!(
+                            "Context window of \"{m}\" in tokens (Enter = unknown, e.g. 128000 or 128k):"
+                        ))
+                        .unwrap_or_default();
+                        match parse_context_input(&s) {
+                            Some(ctx) => {
+                                cfg.providers[i].model_contexts.insert(m.clone(), ctx);
+                                paintln(ANSI_GREEN, &format!("Context of \"{m}\" set to {} tokens.", fmt_tokens(ctx)));
+                            }
+                            None => {
+                                cfg.providers[i].model_contexts.remove(&m);
+                                paintln(ANSI_GREEN, &format!("Context of \"{m}\" cleared."));
+                            }
+                        }
+                    }
+                }
+            }
+            _ => paintln(ANSI_YELLOW, "Unknown menu command (a/e/d/m/x/c/q)."),
         }
     }
     match save_config(cfg) {
@@ -1479,9 +1581,56 @@ fn empty_reply_error(finish_reason: Option<&str>, saw_reasoning: bool) -> String
     }
 }
 
+/// Token usage reported by the API (`usage` object of a chat completion).
+#[derive(Clone, Copy, Default)]
+struct TokenUsage {
+    prompt: u64,
+    completion: u64,
+}
+
+fn json_u64(v: Option<&serde_json::Value>) -> Option<u64> {
+    v.and_then(|x| x.as_u64().or_else(|| x.as_f64().map(|f| f as u64)))
+}
+
+/// Extracts `usage.prompt_tokens` / `usage.completion_tokens` from a
+/// completion JSON object or an SSE chunk.
+fn usage_from_value(v: &serde_json::Value) -> Option<TokenUsage> {
+    let u = v.get("usage")?;
+    let prompt = json_u64(u.get("prompt_tokens"));
+    let completion = json_u64(u.get("completion_tokens"));
+    if prompt.is_none() && completion.is_none() {
+        return None;
+    }
+    Some(TokenUsage {
+        prompt: prompt.unwrap_or(0),
+        completion: completion.unwrap_or(0),
+    })
+}
+
+/// Last `usage` object in a buffered SSE transcript (providers that honour
+/// `stream_options.include_usage` send it in a final chunk with empty choices).
+fn usage_from_sse(text: &str) -> Option<TokenUsage> {
+    let mut found = None;
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(data) = line.strip_prefix("data:") else { continue };
+        let data = data.trim();
+        if data == "[DONE]" || data.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+            if let Some(u) = usage_from_value(&v) {
+                found = Some(u);
+            }
+        }
+    }
+    found
+}
+
 /// Parses a complete (non-streamed) response body: either one JSON
 /// `chat.completion` object or a buffered SSE transcript (`data:` lines).
-fn parse_completion_body(raw: &[u8]) -> Result<String, String> {
+/// Returns the reply text and the reported token usage, if any.
+fn parse_completion_full(raw: &[u8]) -> Result<(String, Option<TokenUsage>), String> {
     let text = String::from_utf8_lossy(raw);
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -1491,9 +1640,10 @@ fn parse_completion_body(raw: &[u8]) -> Result<String, String> {
         if let Some(err) = api_error_message(&v) {
             return Err(format!("API error: {err}"));
         }
+        let usage = usage_from_value(&v);
         if let Some(content) = completion_content(&v) {
             if !content.trim().is_empty() {
-                return Ok(content);
+                return Ok((content, usage));
             }
         }
         let finish = v
@@ -1501,7 +1651,17 @@ fn parse_completion_body(raw: &[u8]) -> Result<String, String> {
             .and_then(serde_json::Value::as_str);
         return Err(empty_reply_error(finish, false));
     }
-    parse_sse_text(&text)
+    parse_sse_text(&text).map(|content| {
+        let usage = usage_from_sse(&text);
+        (content, usage)
+    })
+}
+
+/// Parses a complete (non-streamed) response body: either one JSON
+/// `chat.completion` object or a buffered SSE transcript (`data:` lines).
+#[cfg(test)]
+fn parse_completion_body(raw: &[u8]) -> Result<String, String> {
+    parse_completion_full(raw).map(|(content, _)| content)
 }
 
 /// Parses a buffered SSE transcript without printing (fallback path).
@@ -1921,7 +2081,8 @@ const PHASE_WRITE: u8 = 2; // answer tokens are arriving (text is being rendered
 /// generated (important on slow reasoning models like gpt-oss — otherwise
 /// the user stares at an empty screen for a long time, here they see text
 /// immediately). Returns (full text, whether the reply was printed as a
-/// stream). All errors are returned as strings: the app must not panic.
+/// stream, token usage reported by the API). All errors are returned as
+/// strings: the app must not panic.
 async fn chat_completion(
     client: &reqwest::Client,
     base_url: &str,
@@ -1929,7 +2090,7 @@ async fn chat_completion(
     model: &str,
     root: Option<&Path>,
     messages: &[(String, String)],
-) -> Result<(String, bool), String> {
+) -> Result<(String, bool, Option<TokenUsage>), String> {
     let url = endpoint_url(base_url);
 
     let msgs: Vec<serde_json::Value> = messages
@@ -1939,6 +2100,9 @@ async fn chat_completion(
     let payload = json!({
         "model": model,
         "stream": true,
+        // Ask OpenAI-compatible servers for a final `usage` chunk so the UI
+        // can show real token counts; servers that ignore it just skip it.
+        "stream_options": {"include_usage": true},
         "messages": msgs,
     });
 
@@ -1986,9 +2150,9 @@ async fn chat_completion(
             .bytes()
             .await
             .map_err(|e| format!("Failed to read the API response: {}", error_chain(&e)))?;
-        return parse_completion_body(&raw).map(|content| {
+        return parse_completion_full(&raw).map(|(content, usage)| {
             let shown = print_collapsed_reply(&content, root);
-            (content, shown)
+            (content, shown, usage)
         });
     }
 
@@ -2022,6 +2186,7 @@ async fn chat_completion(
     let mut raw_body: Vec<u8> = Vec::new(); // fallback if the stream shape is odd
     let mut printed = false; // has stream printing started
     let mut stream_error: Option<String> = None;
+    let mut usage: Option<TokenUsage> = None;
     let mut renderer = CollapsedRenderer::with_root(root);
 
     loop {
@@ -2049,6 +2214,10 @@ async fn chat_completion(
                         if let Some(err) = api_error_message(&v) {
                             stream_error = Some(format!("API error: {err}"));
                             break;
+                        }
+                        // Final usage chunk (`choices` empty, `usage` set).
+                        if let Some(u) = usage_from_value(&v) {
+                            usage = Some(u);
                         }
                         let delta = v.pointer("/choices/0/delta");
                         // Visible reply text — render collapsed (text live,
@@ -2116,14 +2285,15 @@ async fn chat_completion(
 
     // --- fallback: buffered body may be plain JSON or a non-standard SSE ---
     if content.trim().is_empty() && stream_error.is_none() {
-        match parse_completion_body(&raw_body) {
-            Ok(text) => {
+        match parse_completion_full(&raw_body) {
+            Ok((text, u)) => {
                 if printed {
                     // Should not normally happen, but keep the transcript sane.
                     println!();
                 }
                 printed = print_collapsed_reply(&text, root);
                 content = text;
+                usage = usage.or(u);
             }
             Err(e) => stream_error = Some(e),
         }
@@ -2135,7 +2305,11 @@ async fn chat_completion(
     if content.trim().is_empty() {
         return Err(empty_reply_error(None, false));
     }
-    Ok((content, printed))
+    // A stream may have ended before the usage chunk — scan the raw body once.
+    if usage.is_none() {
+        usage = usage_from_sse(&String::from_utf8_lossy(&raw_body));
+    }
+    Ok((content, printed, usage))
 }
 
 // ---------------------------------------------------------------------------
@@ -2151,6 +2325,59 @@ fn is_dangerous(cmd: &str) -> bool {
 /// Size of the conversation history in bytes (an estimate for auto-compaction).
 fn history_bytes(history: &[(String, String)]) -> usize {
     history.iter().map(|(r, c)| r.len() + c.len() + 8).sum()
+}
+
+/// Rough token estimate (~4 bytes per token) used when the API does not
+/// report `usage` — good enough for a progress indicator.
+fn estimate_tokens(messages: &[(String, String)]) -> u64 {
+    let bytes: usize = messages.iter().map(|(r, c)| r.len() + c.len() + 16).sum();
+    (bytes / 4) as u64
+}
+
+/// One-line context usage report shown above the `>` prompt: real
+/// `prompt_tokens` when the API sends them, a local estimate otherwise; the
+/// denominator is the context window configured for the model (/config).
+/// Returned with ANSI colors already embedded (dim normally, yellow >70%,
+/// red >90%).
+fn context_status(
+    p: &Provider,
+    model: &str,
+    usage: Option<TokenUsage>,
+    messages: &[(String, String)],
+) -> String {
+    // Occupancy after the reply = prompt + completion tokens.
+    let (used, exact) = match usage {
+        Some(u) if u.prompt + u.completion > 0 => (u.prompt + u.completion, true),
+        _ => (estimate_tokens(messages), false),
+    };
+    let approx = if exact { "" } else { "~" };
+    let limit = context_limit(p, model);
+    if limit == 0 {
+        return format!(
+            "{}context {}{} tokens{}",
+            col(ANSI_DIM),
+            approx,
+            fmt_tokens(used),
+            col(ANSI_RESET)
+        );
+    }
+    let pct = used as f64 / limit as f64 * 100.0;
+    let color = if pct > 90.0 {
+        ANSI_RED
+    } else if pct > 70.0 {
+        ANSI_YELLOW
+    } else {
+        ANSI_DIM
+    };
+    format!(
+        "{}context {}{}/{} ({:.0}%){reset}",
+        col(color),
+        approx,
+        fmt_tokens(used),
+        fmt_tokens(limit),
+        pct,
+        reset = col(ANSI_RESET),
+    )
 }
 
 /// Asks the model to compress the conversation history into a brief summary
@@ -2177,7 +2404,8 @@ async fn compact_history(
             format!("{COMPACT_PROMPT}\n\n=== CONVERSATION HISTORY ===\n{transcript}"),
         ),
     ];
-    let (reply, _) = chat_completion(client, base_url, api_key, model, None, &messages).await?;
+    let (reply, _, _) =
+        chat_completion(client, base_url, api_key, model, None, &messages).await?;
     Ok(reply)
 }
 
@@ -2640,46 +2868,60 @@ async fn agent_turn(
     auto: bool,
     history: &mut Vec<(String, String)>,
     input: String,
+    ctx_status: &mut String,
 ) {
     let mut pending = input;
 
     for round in 0..MAX_AGENT_ROUNDS {
-        // Auto-compaction can also trigger inside a multi-step turn: command
-        // outputs make the history grow faster than plain chat.
-        if history_bytes(history) > AUTO_COMPACT_BYTES {
+        let current_user = mem::take(&mut pending);
+        let (provider, model) = cfg.active();
+
+        // Fresh project scan → system prompt: the model sees the current
+        // state of files, including changes made by previous rounds.
+        let scan = scan_project(root);
+        let build_messages = |hist: &[(String, String)], user: &str| {
+            let mut m = Vec::with_capacity(hist.len() + 2);
+            m.push(("system".to_string(), build_system_prompt(root, &scan)));
+            m.extend(hist.iter().cloned());
+            m.push(("user".to_string(), user.to_string()));
+            m
+        };
+        let mut messages = build_messages(history, &current_user);
+
+        // Auto-compaction when the request approaches the model's context
+        // window — the same compression as /compact, but automatic. Command
+        // outputs make the context grow faster inside a multi-step turn.
+        let limit = context_limit(provider, model);
+        let est = estimate_tokens(&messages);
+        if limit > 0 && est as f64 > limit as f64 * CONTEXT_COMPACT_RATIO {
             paintln(
                 ANSI_YELLOW,
                 &format!(
-                    "The conversation history grew large ({} KB) — compacting…",
-                    history_bytes(history) / 1024
+                    "Context is {:.0}% full (~{} of {} tokens) — compacting the history…",
+                    est as f64 / limit as f64 * 100.0,
+                    fmt_tokens(est),
+                    fmt_tokens(limit)
                 ),
             );
-            let (p, model) = cfg.active();
-            match compact_history(client, &p.base_url, &p.api_key, model, history).await {
+            match compact_history(client, &provider.base_url, &provider.api_key, model, history)
+                .await
+            {
                 Ok(summary) => {
                     *history = vec![(
                         "user".to_string(),
                         format!("[Compressed conversation history]\n{summary}"),
                     )];
+                    messages = build_messages(history, &current_user);
                     paintln(ANSI_GREEN, "History compacted.");
                 }
-                Err(e) => paintln(ANSI_YELLOW, &format!("Compaction failed ({e}) — continuing as is.")),
+                Err(e) => {
+                    paintln(ANSI_YELLOW, &format!("Compaction failed ({e}) — continuing as is."))
+                }
             }
         }
 
-        let current_user = mem::take(&mut pending);
-
-        // Fresh project scan → system prompt: the model sees the current
-        // state of files, including changes made by previous rounds.
-        let scan = scan_project(root);
-        let mut messages: Vec<(String, String)> = Vec::with_capacity(history.len() + 2);
-        messages.push(("system".to_string(), build_system_prompt(root, &scan)));
-        messages.extend(history.iter().cloned());
-        messages.push(("user".to_string(), current_user.clone()));
-
-        let (provider, model) = cfg.active();
         let mut attempt = 0usize;
-        let (reply, streamed) = loop {
+        let (reply, streamed, usage) = loop {
             match chat_completion(
                 client,
                 &provider.base_url,
@@ -2733,6 +2975,7 @@ async fn agent_turn(
         let blocks = parse_blocks(&reply);
         let mut actions: Vec<Action> = Vec::new();
         render_reply(&blocks, &mut actions, streamed);
+        *ctx_status = context_status(provider, model, usage, &messages);
 
         let mut feedback: Vec<String> = Vec::new();
         let mut applied = false;
@@ -2881,6 +3124,8 @@ async fn run() -> i32 {
     // Conversation history (user/assistant) — the system prompt is rebuilt
     // before every request, so it is not stored in the history.
     let mut history: Vec<(String, String)> = Vec::new();
+    // Context-usage line shown above the `>` prompt (updated by agent_turn).
+    let mut ctx_status = String::new();
 
     println!();
     print_help();
@@ -2888,6 +3133,9 @@ async fn run() -> i32 {
 
     // --- Step 3: the main loop ---
     loop {
+        if !ctx_status.is_empty() {
+            println!("{ctx_status}");
+        }
         print!("{}{}>{} ", col(ANSI_BOLD), col(ANSI_CYAN), col(ANSI_RESET));
         let _ = io::stdout().flush();
         let Some(raw_input) = read_line_history() else {
@@ -2908,6 +3156,7 @@ async fn run() -> i32 {
             }
             "/clear" => {
                 history.clear();
+                ctx_status.clear();
                 paintln(ANSI_GREEN, "Conversation history cleared.");
                 continue;
             }
@@ -2991,7 +3240,7 @@ async fn run() -> i32 {
 
         // Steps 4–8 live in agent_turn: auto-compaction, fresh project scan,
         // API request, confirmed actions and action-result feedback.
-        agent_turn(&client, &cfg, &root, auto, &mut history, input).await;
+        agent_turn(&client, &cfg, &root, auto, &mut history, input, &mut ctx_status).await;
     }
 
     println!("Goodbye!");

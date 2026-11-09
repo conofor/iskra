@@ -116,7 +116,8 @@ list:
       "name": "local-ollama",
       "base_url": "http://localhost:11434/v1",
       "api_key": "",
-      "models": ["qwen2.5:1.5b", "llama3"]
+      "models": ["qwen2.5:1.5b", "llama3"],
+      "model_contexts": {"qwen2.5:1.5b": 32768, "llama3": 8192}
     },
     {
       "name": "cloud",
@@ -132,6 +133,13 @@ list:
 
 - The Base URL must include the API version prefix (usually `/v1`); if only
   a host is given, `/v1` is added automatically.
+- `model_contexts` is optional: it maps a model name to its context window
+  in tokens (default 250k). It is asked when a model is added (`/config` or
+  first-run wizard), can be edited later via `/config` → `c`, and is shown
+  in `/models`. Above the `>` prompt the app prints
+  `context used/total (%)` — real `usage` from the API when the provider
+  sends it, a local estimate otherwise. At ~80% of the window the history
+  is compacted automatically.
 - The app speaks the OpenAI **Chat Completions** protocol only, so it always
   appends `/chat/completions` to the Base URL — for every model. The route is
   part of the protocol, not of the model; the model itself is passed in the
@@ -182,8 +190,10 @@ you can give a task and walk away. Safety measures stay in place:
 - commands that look dangerous (`rm -rf`, `mkfs`, `dd of=/dev/…`,
   `shutdown`, `| sh`, etc. — the `DANGEROUS_CMD` list in `src/main.rs`) are
   **blocked** in autopilot, not executed;
-- when the history exceeds ~24 KB it is automatically compressed by the
-  model into a summary.
+- when the request approaches 80% of the model's context window (250k
+  tokens by default, or the value set via `/config` → model context) the
+  history is automatically compressed by the model into a summary — the
+  same as `/compact`.
 
 ## Agent protocol
 
